@@ -2,7 +2,7 @@
 
 A Python bot that bridges SWG in-game chatrooms to Discord channels. Drop a JSON config file per server — each one spawns an independent bot instance that logs into the game, joins a chatroom, and relays messages both ways.
 
-Replaces the original 14-bot Node.js setup with a single Python process.
+Replaces the original 14-bot Node.js setup with a single Python process. Based on the original [swg-discord-bot](https://github.com/dpwhittaker/swg-discord-bot) by [dpwhittaker](https://github.com/dpwhittaker), which implemented the SOE protocol and SWG chat bridge in Node.js.
 
 ## Features
 
