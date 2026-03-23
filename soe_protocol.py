@@ -628,7 +628,7 @@ class SOEProtocol:
             else:
                 self.session.fragments.extend(buf[4:-3])
 
-                if len(self.session.fragments) == self.session.fragment_length:
+                if len(self.session.fragments) >= self.session.fragment_length:
                     reassembled = self.session.fragments
                     self.session.fragments = None
                     operands = struct.unpack_from("<H", reassembled, 0)[0]
@@ -659,6 +659,11 @@ class SOEProtocol:
         while offset < len(buf) - 3:
             pkt_len = buf[offset]
             offset += 1
+            if pkt_len == 0xFF:
+                if offset + 2 > len(buf) - 3:
+                    break
+                pkt_len = struct.unpack_from(">H", buf, offset)[0]
+                offset += 2
             if pkt_len >= 6:
                 sub_operands = struct.unpack_from("<H", buf, offset)[0]
                 opcode = struct.unpack_from("<I", buf, offset + 2)[0]

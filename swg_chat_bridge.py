@@ -160,8 +160,7 @@ class SWGChatClient:
         try:
             packets = self.protocol.decode(data)
         except Exception as e:
-            self.log.error(f"Decode error: {e}")
-            asyncio.ensure_future(self._reconnect())
+            self.log.warning(f"Decode error (skipping packet): {e}")
             return
 
         if not packets:
@@ -438,11 +437,16 @@ class SWGChatClient:
             ack = self.protocol.encode_ack()
             if ack:
                 self._send_raw(ack)
-            if time.time() - self.last_message_time > 10:
+            if time.time() - self.last_message_time > 55:
                 self.fails += 1
+                self.log.warning(f"No data for 55s (fail #{self.fails})")
                 self.connected = False
                 if self.fails == 3:
                     self.on_server_status(False)
+                if self.fails >= 5:
+                    self.log.warning("5 consecutive failures — waiting 30s before retry")
+                    await asyncio.sleep(30)
+                    self.fails = 0
                 self.last_message_time = time.time()
                 await self._reconnect()
 
