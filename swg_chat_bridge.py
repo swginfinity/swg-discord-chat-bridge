@@ -89,6 +89,7 @@ class SWGChatClient:
         self.reconnect_count = 0
         self.messages_sent = 0
         self.messages_received = 0
+        self.last_room_response = time.time()  # tracks last successful room query/enter
 
         self.verbose = cfg.get('verboseSWGLogging', False)
 
@@ -283,6 +284,7 @@ class SWGChatClient:
         target = self.chat_room_path
         if room_id and (target in room_path or room_path.endswith(target.split('.')[-1])):
             self.chat_room_id = room_id
+            self.last_room_response = time.time()
             self.log.info(f"Found chatroom via query: {room_path} (ID: {room_id})")
             self._send_raw(self._encode_chat_enter_room(room_id))
 
@@ -293,6 +295,7 @@ class SWGChatClient:
             if not self.connected:
                 self.connected = True
                 self.log.info(f"Entered chatroom ID# {room_id} as {player}")
+            self.last_room_response = time.time()
             if self.fails >= 3:
                 self.on_server_status(True)
             self.fails = 0
@@ -472,10 +475,18 @@ class SWGChatClient:
             self._send_raw(self.protocol.encode_net_status())
 
     async def _health_check_loop(self):
-        """Periodic chatroom health check — verify we're still in the right room."""
+        """Periodic chatroom health check — verify we're still in the right room.
+        Self-healing: if relay appears stuck (connected but no chatroom activity
+        despite Discord sending messages), force a reconnect."""
+        last_check_msgs_out = 0
+        last_check_msgs_in = 0
+        stale_checks = 0
+        STALE_THRESHOLD = 10  # minutes of no outbound activity before reconnect
+
         while True:
             await asyncio.sleep(60.0)
             if not self.connected or not self.chat_room_id:
+                stale_checks = 0
                 continue
 
             # Re-query room to verify membership
@@ -484,13 +495,45 @@ class SWGChatClient:
                 room_path = f"SWG.{self.server_name}.{room_path}"
             self._send_raw(self._encode_chat_query_room(room_path))
 
+            # Self-heal check 1: room query responses stopped
+            # Health check sends a query every 60s — if no response for 5+ minutes,
+            # the SWG connection is silently dead.
+            room_stale = time.time() - self.last_room_response
+            if room_stale > 300:
+                self.log.warning(
+                    f"SELF-HEAL: No room query response for {int(room_stale)}s — "
+                    f"SWG connection likely dead. Forcing reconnect.")
+                stale_checks = 0
+                self.connected = False
+                await self._reconnect()
+                continue
+
+            # Self-heal check 2: relay appears stuck
+            # Discord is receiving messages (msgs_in up) but nothing sent to SWG (msgs_out flat)
+            if self.messages_sent == last_check_msgs_out and self.messages_received > last_check_msgs_in:
+                stale_checks += 1
+                if stale_checks >= STALE_THRESHOLD:
+                    self.log.warning(
+                        f"SELF-HEAL: Relay appears stuck — {stale_checks} min with no outbound "
+                        f"despite {self.messages_received - last_check_msgs_in} inbound. Forcing reconnect.")
+                    stale_checks = 0
+                    self.connected = False
+                    await self._reconnect()
+                    continue
+            else:
+                stale_checks = 0
+
+            last_check_msgs_out = self.messages_sent
+            last_check_msgs_in = self.messages_received
+
             # Log metrics every 5 minutes
             uptime = int(time.time() - self.start_time)
             if uptime % 300 < 65:  # within the first health check of each 5-min window
                 self.log.info(
                     f"Health: uptime={uptime}s connected={self.connected} "
                     f"room={self.chat_room_id} reconnects={self.reconnect_count} "
-                    f"msgs_in={self.messages_received} msgs_out={self.messages_sent}")
+                    f"msgs_in={self.messages_received} msgs_out={self.messages_sent}"
+                    f"{' stale=' + str(stale_checks) if stale_checks > 0 else ''}")
 
     def get_stats(self):
         """Return current metrics dict."""
