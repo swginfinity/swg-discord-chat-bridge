@@ -865,10 +865,14 @@ def load_configs(config_path):
     return []
 
 
-async def run_bot(name, bot_cfg):
+async def run_bot(name, bot_cfg, startup_delay=0):
     """Run a single bot with automatic restart on failure."""
     log = logging.getLogger(name)
     restart_delay = 5
+
+    if startup_delay > 0:
+        log.info(f"Staggered start: waiting {startup_delay}s...")
+        await asyncio.sleep(startup_delay)
 
     while True:
         bridge = None
@@ -915,7 +919,7 @@ async def run_all(config_path):
             main_log.error("No bot configs found!")
             return
         main_log.info(f"Starting {len(configs)} bot(s) (single file, no hot-reload)")
-        tasks = [asyncio.create_task(run_bot(name, cfg)) for name, cfg in configs]
+        tasks = [asyncio.create_task(run_bot(name, cfg, startup_delay=i * 5)) for i, (name, cfg) in enumerate(configs)]
         tasks.append(asyncio.create_task(_healthcheck_loop()))
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -1016,9 +1020,9 @@ async def run_all(config_path):
             valid.append((name, cfg))
 
         main_log.info(f"Starting {len(valid)} bot(s) (hot-reload enabled, scanning every 10s)")
-        for name, cfg in valid:
+        for i, (name, cfg) in enumerate(valid):
             bot_configs[name] = cfg
-            bot_tasks[name] = asyncio.create_task(run_bot(name, cfg))
+            bot_tasks[name] = asyncio.create_task(run_bot(name, cfg, startup_delay=i * 5))
     else:
         main_log.info("No configs yet — watching for new ones (hot-reload enabled)")
 
