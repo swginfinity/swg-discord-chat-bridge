@@ -296,8 +296,7 @@ class SWGChatClient:
                 self.connected = True
                 self.log.info(f"Entered chatroom ID# {room_id} as {player}")
             self.last_room_response = time.time()
-            if self.fails >= 3:
-                self.on_server_status(True)
+            self.on_server_status(True)
             self.fails = 0
             self._reconnect_delay = 2  # reset backoff on success
 
@@ -610,6 +609,7 @@ class ChatBridge(discord.Client):
         )
 
         self.chat_channel = None
+        self._last_notified_status = None
         self.notification_channel = None
         self.notification_tag = ""
         self.notification_user_id = self.discord_cfg.get('NotificationMentionUserID', '')
@@ -784,6 +784,9 @@ class ChatBridge(discord.Client):
 
     def _relay_server_status(self, is_up):
         """Called by SWG client on server up/down."""
+        if is_up == self._last_notified_status:
+            return
+        self._last_notified_status = is_up
         if self.notification_channel:
             server_name = self.swg_cfg.get('SWGServerName', 'Server')
             status = "UP!" if is_up else "DOWN!"
