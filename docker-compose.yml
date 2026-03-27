@@ -3,6 +3,7 @@ services:
     build: .
     container_name: swg-chatbots
     restart: unless-stopped
+    network_mode: host
     volumes:
       - ./configs:/app/configs:ro
     logging:
