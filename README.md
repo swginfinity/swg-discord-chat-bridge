@@ -38,6 +38,10 @@ python3 swg_chat_bridge.py configs/my-server.json
 
 ### Run with Docker
 
+**Important:** The compose file uses `network_mode: host` because the SWG login server communicates over UDP. Docker bridge networking blocks UDP responses, causing bots to timeout during the login handshake. Do not remove `network_mode: host`.
+
+Bots start with a 5-second stagger between each to avoid overwhelming the login server with simultaneous connection attempts.
+
 ```bash
 # Copy and edit a config
 cp configs/example.json configs/my-server.json
@@ -47,6 +51,9 @@ docker compose up -d
 
 # View logs
 docker logs -f swg-chatbots
+
+# Rebuild after code changes
+git pull && docker compose down && docker compose up -d --build
 
 # Add another bot (no restart needed — hot-reload picks it up)
 cp configs/example.json configs/second-server.json
