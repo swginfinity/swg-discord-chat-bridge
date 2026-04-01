@@ -21,6 +21,7 @@ import time
 import logging
 import signal
 import pathlib
+import re
 
 import discord
 
@@ -755,7 +756,14 @@ class ChatBridge(discord.Client):
 
         # Forward chat channel messages to SWG
         if isinstance(message.channel, discord.TextChannel) and message.channel.name == self.discord_cfg['ChatChannel']:
-            self.swg.send_chat(message.clean_content, sender)
+            text = message.clean_content
+            # Strip URLs — SWG client can't handle them and they cause disconnects
+            text = re.sub(r'https?://\S+', '[link]', text)
+            # Strip any HTML-like tags
+            text = re.sub(r'<[^>]+>', '', text)
+            text = text.strip()
+            if text:
+                self.swg.send_chat(text, sender)
 
     async def _send_to_discord(self, channel, content, retries=3):
         """Send a message to Discord with retry logic."""
