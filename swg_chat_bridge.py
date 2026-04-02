@@ -794,8 +794,9 @@ class ChatBridge(discord.Client):
         """Called by SWG client on server up/down."""
         if is_up == self._last_notified_status:
             return
-        if not is_up and self._last_notified_status is None:
-            return  # Don't fire DOWN on startup before first successful connect
+        if self._last_notified_status is None:
+            self._last_notified_status = is_up
+            return  # Don't fire UP or DOWN on first connect (bot restart, not server event)
         self._last_notified_status = is_up
         if self.notification_channel:
             server_name = self.swg_cfg.get('SWGServerName', 'Server')
