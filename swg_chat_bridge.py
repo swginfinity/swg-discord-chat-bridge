@@ -396,7 +396,10 @@ class SWGChatClient:
         """Encode ChatInstantMessageToCharacter (0x84bb21f7)."""
         header = self.protocol.encode_soe_header(0x84bb21f7, 5)
         msg_encoded = message.encode('utf-16-le')
-        buf = bytearray(512)
+        # Calculate actual size needed: 3 astrings + uint32 + msg + uint32 + uint32
+        server = self.server_name or ""
+        needed = (2 + 3) + (2 + len(server)) + (2 + len(player)) + 4 + len(msg_encoded) + 4 + 4
+        buf = bytearray(needed)
         off = 0
         off = _write_astring(buf, off, "SWG")
         off = _write_astring(buf, off, self.server_name or "")

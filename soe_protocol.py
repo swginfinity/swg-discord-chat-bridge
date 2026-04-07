@@ -490,7 +490,8 @@ class SOEProtocol:
     def encode_chat_send_to_room(self, message: str, room_id: int) -> bytearray:
         """Encode ChatSendToRoom message."""
         header = self.encode_soe_header(0x20e4dbe3, 5)
-        buf = bytearray(len(message) * 2 + 16)
+        msg_bytes = len(message.encode('utf-16-le'))
+        buf = bytearray(4 + msg_bytes + 12)  # uint32 len + utf16 data + spacer + room_id + req_id
         off = 0
         off = _write_ustring(buf, off, message)
         # 4 bytes spacer (zeros)
