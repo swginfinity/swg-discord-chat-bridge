@@ -77,6 +77,7 @@ class SWGChatClient:
         self.character_id = None
         self.chat_room_id = None
         self.chat_room_path = cfg['ChatRoom']
+        self.chat_room_full_path = None  # resolved full path from server, used for health check queries
 
         self.last_message_time = time.time()
         self.fails = 0
@@ -260,6 +261,7 @@ class SWGChatClient:
             room_path = room.get('path', '')
             if room_path.endswith(target_room) or target_room in room_path:
                 self.chat_room_id = room.get('id', room_id)
+                self.chat_room_full_path = room_path
                 self.log.info(f"Found chatroom: {room_path} (ID: {self.chat_room_id})")
                 self._send_raw(self._encode_chat_enter_room(self.chat_room_id))
                 break
@@ -273,6 +275,7 @@ class SWGChatClient:
             target = self.chat_room_path
             if target in room_path or room_path.endswith(target.split('.')[-1]):
                 self.chat_room_id = room_id
+                self.chat_room_full_path = room_path
                 self.log.info(f"Created chatroom: {room_path} (ID: {room_id})")
                 self._send_raw(self._encode_chat_enter_room(room_id))
         else:
@@ -285,6 +288,7 @@ class SWGChatClient:
         target = self.chat_room_path
         if room_id and (target in room_path or room_path.endswith(target.split('.')[-1])):
             self.chat_room_id = room_id
+            self.chat_room_full_path = room_path
             self.last_room_response = time.time()
             self.log.info(f"Found chatroom via query: {room_path} (ID: {room_id})")
             self._send_raw(self._encode_chat_enter_room(room_id))
@@ -492,10 +496,12 @@ class SWGChatClient:
                 stale_checks = 0
                 continue
 
-            # Re-query room to verify membership
-            room_path = self.chat_room_path
-            if not room_path.startswith("SWG."):
-                room_path = f"SWG.{self.server_name}.{room_path}"
+            # Re-query room to verify membership — use resolved full path if available
+            room_path = self.chat_room_full_path
+            if not room_path:
+                room_path = self.chat_room_path
+                if not room_path.startswith("SWG."):
+                    room_path = f"SWG.{self.server_name}.{room_path}"
             self._send_raw(self._encode_chat_query_room(room_path))
 
             # Self-heal check 1: room query responses stopped
