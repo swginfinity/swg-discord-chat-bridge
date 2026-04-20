@@ -648,7 +648,11 @@ class ChatBridge(discord.Client):
             async def _auto_restart():
                 await asyncio.sleep(restart_mins * 60)
                 self.log.info("Auto-restart triggered")
-                await self.swg.stop()
+                # disconnect() sends encode_disconnect() first, so SWG server cleans
+                # up our chatroom subscription. stop() alone just drops the UDP socket,
+                # leaving server-side subscription stale — new session then receives
+                # no chat room messages (msgs_in stays 0). See RCA 2026-04-19.
+                await self.swg.disconnect()
                 await self.close()
 
             asyncio.create_task(_auto_restart())
