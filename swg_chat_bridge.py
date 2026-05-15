@@ -488,12 +488,15 @@ class SWGChatClient:
         last_check_msgs_out = 0
         last_check_msgs_in = 0
         stale_checks = 0
+        in_stale_checks = 0
         STALE_THRESHOLD = 10  # minutes of no outbound activity before reconnect
+        IN_STALE_THRESHOLD = 60  # minutes of no inbound activity before reconnect (silent SWG-side subscription drop)
 
         while True:
             await asyncio.sleep(60.0)
             if not self.connected or not self.chat_room_id:
                 stale_checks = 0
+                in_stale_checks = 0
                 continue
 
             # Re-query room to verify membership — use resolved full path if available
@@ -532,6 +535,25 @@ class SWGChatClient:
             else:
                 stale_checks = 0
 
+            # Self-heal check 3: chatroom reception silently dead
+            # msgs_in flat for IN_STALE_THRESHOLD min despite room query responses still arriving.
+            # Failure mode: SWG-side drops our chatroom subscription without notifying us;
+            # socket stays up, queries still echo (the room exists), but we receive no chat traffic.
+            # Check 1 doesn't catch it (queries still responding). Check 2 doesn't catch it
+            # (both counters flat — no Discord asymmetry).
+            if self.messages_received == last_check_msgs_in:
+                in_stale_checks += 1
+                if in_stale_checks >= IN_STALE_THRESHOLD:
+                    self.log.warning(
+                        f"SELF-HEAL: msgs_in flat for {in_stale_checks} min despite query responses — "
+                        f"silent SWG-side subscription drop. Forcing reconnect.")
+                    in_stale_checks = 0
+                    self.connected = False
+                    await self._reconnect()
+                    continue
+            else:
+                in_stale_checks = 0
+
             last_check_msgs_out = self.messages_sent
             last_check_msgs_in = self.messages_received
 
@@ -542,7 +564,8 @@ class SWGChatClient:
                     f"Health: uptime={uptime}s connected={self.connected} "
                     f"room={self.chat_room_id} reconnects={self.reconnect_count} "
                     f"msgs_in={self.messages_received} msgs_out={self.messages_sent}"
-                    f"{' stale=' + str(stale_checks) if stale_checks > 0 else ''}")
+                    f"{' stale=' + str(stale_checks) if stale_checks > 0 else ''}"
+                    f"{' in_stale=' + str(in_stale_checks) if in_stale_checks > 0 else ''}")
 
     def get_stats(self):
         """Return current metrics dict."""
