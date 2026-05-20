@@ -291,7 +291,11 @@ class SWGChatClient:
             self.chat_room_full_path = room_path
             self.last_room_response = time.time()
             self.log.info(f"Found chatroom via query: {room_path} (ID: {room_id})")
-            self._send_raw(self._encode_chat_enter_room(room_id))
+            # Only (re)enter when not already in the room. The 60s liveness
+            # query stays, but re-entering on every query produced join/leave
+            # churn the health monitor misread as a zombie.
+            if not self.connected:
+                self._send_raw(self._encode_chat_enter_room(room_id))
 
     def _handle_ChatOnEnteredRoom(self, pkt):
         player = pkt.get('player', '')

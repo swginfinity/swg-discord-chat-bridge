@@ -937,6 +937,20 @@ class SOEProtocol:
             return {"type": "ChatOnEnteredRoom", "player": player_name,
                     "room_id": room_id, "error": error}
 
+        elif opcode == 0x60b5098b:  # ChatOnLeaveRoom
+            # Same wire layout as ChatOnEnteredRoom (Core3 ChatOnLeaveRoom.h):
+            # ChatAvatar (SWG/Galaxy/Name astrings) + error + room_id + request_id.
+            # Without decoding player/room_id the handler cannot tell its own
+            # leave from the broadcast of every other member leaving the room.
+            off = 0
+            _, off = _read_astring(data, off)  # SWG
+            _, off = _read_astring(data, off)  # Galaxy
+            player_name, off = _read_astring(data, off)
+            error = struct.unpack_from("<I", data, off)[0]
+            room_id = struct.unpack_from("<I", data, off + 4)[0]
+            return {"type": "ChatOnLeaveRoom", "player": player_name,
+                    "room_id": room_id, "error": error}
+
         elif opcode == 0x1DB575CC:  # ClientCreateCharacterSuccess
             char_id = struct.unpack_from("<Q", data, 0)[0]
             return {"type": "ClientCreateCharacterSuccess", "character_id": char_id}
