@@ -487,19 +487,18 @@ class SWGChatClient:
 
     async def _health_check_loop(self):
         """Periodic chatroom health check — verify we're still in the right room.
-        Self-healing: if relay appears stuck (connected but no chatroom activity
-        despite Discord sending messages), force a reconnect."""
-        last_check_msgs_out = 0
+        Self-heal: if the SWG connection goes silently dead (room queries stop
+        echoing), force a reconnect. That room-query timeout is the one reliable
+        liveness signal; the former msgs_out / msgs_in reconnect heuristics were
+        removed 2026-05-22 — they false-positived on every normal quiet room
+        (see chat-bridge-self-heal-falsepositive-fix-2026-05-21.md)."""
         last_check_msgs_in = 0
-        stale_checks = 0
         in_stale_checks = 0
-        STALE_THRESHOLD = 10  # minutes of no outbound activity before reconnect
-        IN_STALE_THRESHOLD = 60  # minutes of no inbound activity before reconnect (silent SWG-side subscription drop)
+        IN_STALE_THRESHOLD = 60  # minutes of no inbound chat before a log-only notice
 
         while True:
             await asyncio.sleep(60.0)
             if not self.connected or not self.chat_room_id:
-                stale_checks = 0
                 in_stale_checks = 0
                 continue
 
@@ -511,54 +510,33 @@ class SWGChatClient:
                     room_path = f"SWG.{self.server_name}.{room_path}"
             self._send_raw(self._encode_chat_query_room(room_path))
 
-            # Self-heal check 1: room query responses stopped
-            # Health check sends a query every 60s — if no response for 5+ minutes,
-            # the SWG connection is silently dead.
+            # Self-heal: room query responses stopped.
+            # The health check sends a query every 60s — if no response for 5+
+            # minutes, the SWG socket is silently dead. This is the ONLY reliable
+            # liveness signal, so it keeps the forced reconnect.
             room_stale = time.time() - self.last_room_response
             if room_stale > 300:
                 self.log.warning(
                     f"SELF-HEAL: No room query response for {int(room_stale)}s — "
                     f"SWG connection likely dead. Forcing reconnect.")
-                stale_checks = 0
                 self.connected = False
                 await self._reconnect()
                 continue
 
-            # Self-heal check 2: relay appears stuck
-            # Discord is receiving messages (msgs_in up) but nothing sent to SWG (msgs_out flat)
-            if self.messages_sent == last_check_msgs_out and self.messages_received > last_check_msgs_in:
-                stale_checks += 1
-                if stale_checks >= STALE_THRESHOLD:
-                    self.log.warning(
-                        f"SELF-HEAL: Relay appears stuck — {stale_checks} min with no outbound "
-                        f"despite {self.messages_received - last_check_msgs_in} inbound. Forcing reconnect.")
-                    stale_checks = 0
-                    self.connected = False
-                    await self._reconnect()
-                    continue
-            else:
-                stale_checks = 0
-
-            # Self-heal check 3: chatroom reception silently dead
-            # msgs_in flat for IN_STALE_THRESHOLD min despite room query responses still arriving.
-            # Failure mode: SWG-side drops our chatroom subscription without notifying us;
-            # socket stays up, queries still echo (the room exists), but we receive no chat traffic.
-            # Check 1 doesn't catch it (queries still responding). Check 2 doesn't catch it
-            # (both counters flat — no Discord asymmetry).
+            # Inbound-stall notice — LOG-ONLY, not a reconnect trigger.
+            # "msgs_in flat for 60 min" cannot tell a genuinely quiet room from a
+            # dropped subscription, so forcing a reconnect false-positived on
+            # every low-traffic room. The room-query check above already catches
+            # a truly dead connection. Logged at info for visibility only.
             if self.messages_received == last_check_msgs_in:
                 in_stale_checks += 1
-                if in_stale_checks >= IN_STALE_THRESHOLD:
-                    self.log.warning(
-                        f"SELF-HEAL: msgs_in flat for {in_stale_checks} min despite query responses — "
-                        f"silent SWG-side subscription drop. Forcing reconnect.")
-                    in_stale_checks = 0
-                    self.connected = False
-                    await self._reconnect()
-                    continue
+                if in_stale_checks == IN_STALE_THRESHOLD:
+                    self.log.info(
+                        f"No inbound chat for {in_stale_checks} min — room is quiet "
+                        f"(query responses still arriving; not reconnecting).")
             else:
                 in_stale_checks = 0
 
-            last_check_msgs_out = self.messages_sent
             last_check_msgs_in = self.messages_received
 
             # Log metrics every 5 minutes
@@ -568,7 +546,6 @@ class SWGChatClient:
                     f"Health: uptime={uptime}s connected={self.connected} "
                     f"room={self.chat_room_id} reconnects={self.reconnect_count} "
                     f"msgs_in={self.messages_received} msgs_out={self.messages_sent}"
-                    f"{' stale=' + str(stale_checks) if stale_checks > 0 else ''}"
                     f"{' in_stale=' + str(in_stale_checks) if in_stale_checks > 0 else ''}")
 
     def get_stats(self):
