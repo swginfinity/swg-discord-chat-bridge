@@ -63,6 +63,64 @@ cp configs/example.json configs/second-server.json
 mv configs/my-server.json configs/my-server.json.disabled
 ```
 
+### Run with a process manager (PM2 or forever)
+
+For a host without Docker, a Node process manager can keep the Python bridge
+alive across crashes and reboots. Both run the **same** `swg_chat_bridge.py`
+entry point — point them at the venv's interpreter so dependencies resolve, and
+start from the repo root so the relative `configs/` path is found. (No
+`network_mode` caveat here — running on the host directly, UDP to the SWG login
+server works normally.)
+
+The bridge already auto-reconnects to SWG and self-restarts its bot threads on
+crash; the process manager only adds whole-process supervision (OOM kill, an
+unhandled exit, host reboot).
+
+**PM2** (recommended of the two — better logs, boot persistence):
+
+```bash
+npm install -g pm2          # one-time
+
+# Start (scans configs/). Run from the repo root.
+pm2 start swg_chat_bridge.py \
+  --name swg-chat-bridge \
+  --interpreter "$(pwd)/.venv/bin/python3" \
+  --time                    # timestamp log lines
+
+# Or a single config: args after `--`
+pm2 start swg_chat_bridge.py --name swg-chat-bridge \
+  --interpreter "$(pwd)/.venv/bin/python3" -- configs/my-server.json
+
+pm2 logs swg-chat-bridge    # tail logs
+pm2 restart swg-chat-bridge
+pm2 stop swg-chat-bridge
+
+# Survive a host reboot
+pm2 save
+pm2 startup                 # run the command it prints (sets up the init script)
+```
+
+**forever:**
+
+```bash
+npm install -g forever      # one-time
+
+# -c sets the interpreter; run from the repo root so configs/ resolves
+forever start -c "$(pwd)/.venv/bin/python3" \
+  -l "$(pwd)/forever-chat.log" --append \
+  swg_chat_bridge.py
+
+forever list                          # show running scripts
+forever logs swg_chat_bridge.py -f    # tail logs
+forever restart swg_chat_bridge.py
+forever stop swg_chat_bridge.py
+```
+
+> Run only one supervisor at a time — don't stack PM2/forever on top of the
+> Docker container (or each other) for the same configs, or you'll get
+> duplicate bots logging into the same chatroom. Docker (above) remains the
+> production deployment; PM2/forever are alternatives for non-Docker hosts.
+
 ## Configuration
 
 Each bot needs a JSON file in the `configs/` folder. See `configs/example.json` for a full template.
