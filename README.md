@@ -121,6 +121,34 @@ forever stop swg_chat_bridge.py
 > duplicate bots logging into the same chatroom. Docker (above) remains the
 > production deployment; PM2/forever are alternatives for non-Docker hosts.
 
+## Troubleshooting
+
+### `ModuleNotFoundError: No module named 'discord'`
+
+You ran the bot with a Python that doesn't have the dependencies installed —
+almost always because you ran `python3 swg_chat_bridge.py` **without first
+installing `requirements.txt`** (or outside the virtualenv where you installed
+them). The dependencies (`discord.py`) are not bundled; you have to install them.
+
+Fix — from the repo directory:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+python3 swg_chat_bridge.py
+```
+
+Every later run must use that same environment — either `source .venv/bin/activate`
+first, or call the venv's Python directly: `./.venv/bin/python3 swg_chat_bridge.py`.
+If you use a process manager, point it at the venv interpreter (see
+[Run with a process manager](#run-with-a-process-manager-pm2-or-forever)) — a
+bare `pm2 start … --interpreter python3` hits the same missing-module error.
+
+(Quick install without a venv: `pip3 install -r requirements.txt` — but on
+newer distros this fails with an "externally-managed-environment" error, which
+is exactly why the venv steps above are the recommended path.)
+
 ## Configuration
 
 Each bot needs a JSON file in the `configs/` folder. See `configs/example.json` for a full template.
