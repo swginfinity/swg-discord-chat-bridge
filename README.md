@@ -19,6 +19,18 @@ Replaces the original 14-bot Node.js setup with a single Python process. Based o
 
 ### Run directly
 
+> **Debian / Ubuntu one-time prerequisite.** The `venv` and `pip` modules are
+> not bundled with the base `python3` package on Debian (or a minimal Ubuntu),
+> so `python3 -m venv` fails with *"ensurepip is not available … you need to
+> install the python3-venv package"*. Install them first:
+>
+> ```bash
+> sudo apt update && sudo apt install -y python3-venv python3-pip
+> ```
+>
+> (Fedora/RHEL: `sudo dnf install python3 python3-pip`. macOS/Windows: the
+> python.org installer already includes both.)
+
 ```bash
 # Install dependencies
 python3 -m venv .venv
