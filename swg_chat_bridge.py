@@ -51,6 +51,24 @@ STATE_DIR = os.environ.get('CHATBRIDGE_STATE_DIR', '/tmp/chatbridge_state')
 REQUIRED_SWG_KEYS = {'LoginAddress', 'LoginPort', 'Character', 'ChatRoom', 'Username', 'Password'}
 REQUIRED_DISCORD_KEYS = {'BotToken', 'ServerID', 'ChatChannel'}
 
+# World-state packets the bridge receives only because its relay character stands in-world,
+# but never handles. Suppressed from the per-packet `recv:` debug so verbose logging stays
+# readable: UpdateTransformMessage alone is ~98% of inbound traffic (~70/s) and rolls the
+# capped docker log in minutes, blinding diagnosis. Genuinely-flip-`verbose`-and-debug the
+# chat/login/control packets still show. (2026-06-30)
+NOISY_RECV_PACKETS = frozenset({
+    'UpdateTransformMessage',
+    'UpdateTransformWithParentMessage',
+    'DeltasMessage',
+    'BaselinesMessage',
+    'ObjControllerMessage',
+    'UpdateContainmentMessage',
+    'UpdatePvpStatusMessage',
+    'SceneCreateObjectByCrc',
+    'SceneDestroyObject',
+    'SceneEndBaselines',
+})
+
 
 # =============================================================================
 # SWG Client (UDP) — async wrapper around SOE protocol
@@ -178,7 +196,7 @@ class SWGChatClient:
 
         for pkt in packets:
             ptype = pkt.get('type', '')
-            if self.verbose:
+            if self.verbose and ptype not in NOISY_RECV_PACKETS:
                 # Show packet data for debugging, but truncate large payloads
                 pkt_summary = {k: v for k, v in pkt.items() if k != '_raw'}
                 detail = str(pkt_summary)
