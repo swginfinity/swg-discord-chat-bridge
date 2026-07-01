@@ -40,6 +40,13 @@ main_log = logging.getLogger('main')
 # Healthcheck file — touch periodically so Docker can check mtime
 HEALTHCHECK_FILE = os.environ.get('HEALTHCHECK_FILE', '/tmp/chatbridge_alive')
 
+# Per-bot last-announced server status, persisted across bot restarts. Without this,
+# a restart (e.g. the AutoRestartTimer, or a crash-restart) that lands during a server
+# outage forgets it already announced DOWN, so the recovery "UP" is swallowed as a
+# "first connect, not a server event". Lives in the container fs (not a mount), so a
+# deliberate redeploy still resets to baseline and won't emit a spurious UP. (RCA 2026-06-30)
+STATE_DIR = os.environ.get('CHATBRIDGE_STATE_DIR', '/tmp/chatbridge_state')
+
 # Required config keys for validation
 REQUIRED_SWG_KEYS = {'LoginAddress', 'LoginPort', 'Character', 'ChatRoom', 'Username', 'Password'}
 REQUIRED_DISCORD_KEYS = {'BotToken', 'ServerID', 'ChatChannel'}
@@ -623,7 +630,14 @@ class ChatBridge(discord.Client):
         )
 
         self.chat_channel = None
-        self._last_notified_status = None  # None = never connected; suppress DOWN until first successful connect
+        # Persisted across bot restarts so a restart can't forget we already announced
+        # DOWN and then swallow the recovery UP. None = never recorded (genuine first start).
+        self._status_state_file = os.path.join(STATE_DIR, f"{self.config_name}.status")
+        self._last_notified_status = self._load_status()
+        # Gate DOWN announcements until we've confirmed connectivity at least once this
+        # session: a fails==3 during our own (re)connect handshake can't be told apart from
+        # a real server-down, and against a persisted UP state would fire a spurious DOWN.
+        self._connected_this_session = False
         self.notification_channel = None
         self.notification_tag = ""
         self.notification_user_id = self.discord_cfg.get('NotificationMentionUserID', '')
@@ -807,14 +821,48 @@ class ChatBridge(discord.Client):
             self.log.info(f"Tell from {player}: {message}")
             self.swg.send_tell(player, "Sorry, I don't talk to strangers ... XOXO")
 
+    def _load_status(self):
+        """Last-announced server status, persisted across bot restarts.
+        Returns True/False, or None if never recorded (genuine first start)."""
+        try:
+            with open(self._status_state_file) as f:
+                val = json.load(f)
+            if isinstance(val, bool):
+                return val
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            self.log.warning(f"Could not read status state {self._status_state_file}: {e}")
+        return None
+
+    def _save_status(self):
+        """Persist the last-announced status (atomic) so a restart can't lose it."""
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            tmp = self._status_state_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self._last_notified_status, f)
+            os.replace(tmp, self._status_state_file)
+        except Exception as e:
+            self.log.warning(f"Could not persist status state {self._status_state_file}: {e}")
+
     def _relay_server_status(self, is_up):
         """Called by SWG client on server up/down."""
+        if is_up:
+            # A True status only arrives from a confirmed chatroom entry = real connectivity.
+            self._connected_this_session = True
+        elif not self._connected_this_session:
+            # Suppress a DOWN before our first successful connect this session — can't tell a
+            # real server-down from our own stalled handshake. Don't touch persisted state.
+            return
         if is_up == self._last_notified_status:
             return
         if self._last_notified_status is None:
             self._last_notified_status = is_up
+            self._save_status()
             return  # Don't fire UP or DOWN on first connect (bot restart, not server event)
         self._last_notified_status = is_up
+        self._save_status()
         if self.notification_channel:
             server_name = self.swg_cfg.get('SWGServerName', 'Server')
             status = "UP!" if is_up else "DOWN!"
