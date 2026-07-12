@@ -122,6 +122,7 @@ class SOESession:
         self.next_expected = 0          # the reliable id we need next (unbounded)
         self.initialized = False        # have we committed the server's sequence origin?
         self.bootstrap_streak = 0       # consecutive in-order stamps seen while bootstrapping
+        self.boot_origin = 0            # provisional session origin (see _accept_inorder)
         self.gap_min = None             # LOWEST id seen ABOVE the hole (== min(pending), no payloads)
         self.gap_since = None           # when the current hole formed (monotonic)
         # instrumentation (always counted, even when the fix is OFF)
@@ -420,38 +421,61 @@ class SOEProtocol:
         # BOOTSTRAP. We cannot assume the server starts at 0: `//serverSequence = 0;`
         # is COMMENTED OUT in Core3's close() (BaseClient.cpp:362), so a reused
         # BaseClient can begin mid-stream. Assuming 0 would make every real packet
-        # read as a duplicate -> permanent silent deafness. So we adopt the server's
-        # origin — but we require N consecutive in-order stamps before committing it,
-        # so that a single stray/reordered packet cannot define the origin.
-        if not s.initialized:
-            rid = stamp
-            if s.next_expected == 0 and s.bootstrap_streak == 0:
-                s.next_expected = rid           # provisional origin
-            if rid == s.next_expected:
-                s.bootstrap_streak += 1
-                s.next_expected += 1
-                s.reliable_accepted += 1
-                if s.bootstrap_streak >= self._BOOTSTRAP_CONFIRM:
-                    s.initialized = True
-                    if s.next_expected != self._BOOTSTRAP_CONFIRM:
-                        print(f"[soe] WARN: session origin was not 0 "
-                              f"(committed next_expected={s.next_expected})")
-                return True                     # deliver; ack is withheld until committed
-            # a stamp that breaks the streak: restart the bootstrap on THIS stamp
-            s.bootstrap_streak = 1
-            s.next_expected = rid + 1
-            s.reliable_accepted += 1
-            return True
+        # read as a duplicate -> permanent silent deafness. So we ADOPT the server's
+        # origin from the first reliable packet we see, and require N consecutive
+        # in-order stamps before committing it, so a single stray cannot define it.
+        #
+        # 🔴 The bootstrap runs the SAME gap-tracking logic as steady state. An earlier
+        # version had a separate "streak-break" branch that did `next_expected = rid+1;
+        # return True` — i.e. it DELIVERED an out-of-order packet and JUMPED THE HOLE.
+        # Once the streak completed, encode_ack then AckAll'd past that hole and Core3
+        # deleted the packet we never got — THE EXACT BUG THIS FEATURE EXISTS TO PREVENT,
+        # and gaps_observed never even saw it. Made worse by the fact that we withhold the
+        # ack until commit, which PROVOKES the very resend that broke the streak.
+        # Never advance past a hole. Not even here.
+        if not s.initialized and s.bootstrap_streak == 0 and s.gap_min is None:
+            s.next_expected = stamp             # provisional origin: the first id we saw
+            s.boot_origin = stamp
 
-        rid = self._reliable_incoming_id(stamp)
+        # During the bootstrap use the RAW stamp: the wrap reconstruction centers on
+        # next_expected, and a provisional origin that is wrong-by-a-lot would make it
+        # "correct" a real id by +/-0x10000. A session cannot wrap in its first few
+        # packets, so there is nothing to reconstruct yet.
+        rid = stamp if not s.initialized else self._reliable_incoming_id(stamp)
+
+        if not s.initialized and rid < s.boot_origin:
+            # BELOW our provisional origin. We never accepted anything under the origin,
+            # so this CANNOT be a duplicate — it means our first packet was a straggler
+            # and we started too high. Adopt the lower origin and restart the streak.
+            #
+            # Comparing against boot_origin (not next_expected) is load-bearing. A packet
+            # RESENT by Core3 mid-bootstrap — which we actively provoke by withholding the
+            # ack until commit — sits in [boot_origin, next_expected). Treating THAT as
+            # "we started too high" would re-lower the origin and DELIVER IT A SECOND TIME:
+            # double-dispatched handshake, duplicate chat lines into Discord.
+            #   rid <  boot_origin              -> we started too high  (adopt)
+            #   boot_origin <= rid < next_expec -> ordinary duplicate   (drop)
+            s.boot_origin = rid
+            s.next_expected = rid
+            s.bootstrap_streak = 0
+            s.gap_min = s.gap_since = None
 
         if rid < s.next_expected:
             return False                        # duplicate / already delivered — drop, do NOT re-ack
 
         if rid == s.next_expected:              # the one we are waiting for
             s.next_expected += 1
+            s.last_sequence = rid               # keep seq= meaningful in the health line
             s.reliable_accepted += 1
             s.gap_min = s.gap_since = None      # hole (if any) is closed
+            if not s.initialized:
+                s.bootstrap_streak += 1
+                if s.bootstrap_streak >= self._BOOTSTRAP_CONFIRM:
+                    s.initialized = True        # ack is withheld until this commits
+                    origin = s.next_expected - s.bootstrap_streak
+                    if origin != 0:
+                        print(f"[soe] WARN: session origin was {origin}, not 0 "
+                              f"(Core3 close() does not reset serverSequence)")
             return True
 
         # rid > next_expected: a GAP. Drop this packet and do NOT advance. We simply
@@ -831,6 +855,7 @@ class SOEProtocol:
             self.session.next_expected = 0
             self.session.initialized = False
             self.session.bootstrap_streak = 0
+            self.session.boot_origin = 0
             self.session.gap_min = None
             self.session.gap_since = None
             return [{"type": "SessionResponse",

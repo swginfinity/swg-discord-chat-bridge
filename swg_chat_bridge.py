@@ -128,6 +128,7 @@ class SWGChatClient:
         self.filtered_packets = 0     # datagrams dropped as not-from-our-peer
         self.datagrams_in = 0         # non-ping datagrams accepted from our peer
         self.watchdog_trips = 0
+        self._watchdog_cooldown_until = 0.0
 
         self.verbose = cfg.get('verboseSWGLogging', False)
 
@@ -559,23 +560,52 @@ class SWGChatClient:
         WINDOW = 30.0
         MIN_DATAGRAMS = 10
         while True:
-            accepted_before = self.protocol.session.reliable_accepted
+            # Snapshot the PROTOCOL OBJECT, not just its counter. self.protocol is
+            # REPLACED on _connect and on the login->zone handoff, so comparing a
+            # counter across a swap yields a negative delta and silently MISSES a
+            # deafness event. Sample and compare the same object, or skip the window.
+            proto = self.protocol
+            accepted_before = proto.session.reliable_accepted
             datagrams_before = self.datagrams_in
+            paused_before = self.paused
             await asyncio.sleep(WINDOW)
 
-            if self.paused or self._reconnecting or not self.transport:
+            # Guards are re-checked AFTER the sleep, so anything that was true for any
+            # part of the window invalidates it. A bot that was PAUSED sits in the
+            # watchdog's exact signature — it stops acking, so Core3 fills its unacked
+            # window and floods resends: datagrams >> 10, accepted == 0. If the window
+            # merely ENDED unpaused we would force-reconnect a perfectly healthy bot.
+            # Same for a reconnect or a protocol swap mid-window: the counters are not
+            # comparable. In every one of those cases, discard the window.
+            if (self.paused or paused_before or self._reconnecting
+                    or not self.transport or self.protocol is not proto):
                 continue
 
-            accepted = self.protocol.session.reliable_accepted - accepted_before
+            accepted = proto.session.reliable_accepted - accepted_before
             datagrams = self.datagrams_in - datagrams_before
 
             if accepted == 0 and datagrams >= MIN_DATAGRAMS:
+                # Cooldown: a reconnect cannot fix a fault that is INSIDE us (e.g. a
+                # dead _ack_loop means we never ack, Core3 floods resends, and we trip
+                # again on the very next window). Without this, silent deafness would
+                # be traded for an endless reconnect loop — each one dropping chat.
+                # Reconnect, then give it room to actually establish before judging again.
+                if time.monotonic() - self._watchdog_cooldown_until < 0:
+                    continue
+                self._watchdog_cooldown_until = time.monotonic() + 120
+
                 self.watchdog_trips += 1
                 self.log.warning(
                     f"WATCHDOG: {datagrams} datagrams in {WINDOW:.0f}s, ZERO reliable packets "
                     f"accepted — sequence layer is deaf while the socket is alive. "
                     f"Forcing reconnect (trip #{self.watchdog_trips})."
                 )
+                if self.watchdog_trips >= 3:
+                    self.log.error(
+                        f"WATCHDOG has now fired {self.watchdog_trips} times — reconnecting is "
+                        f"NOT curing this. The fault is likely on our side (a dead background "
+                        f"task?), not the link. Investigate; do not assume the reconnect fixed it."
+                    )
                 await self._reconnect()
 
     async def _ack_loop(self):
@@ -1132,6 +1162,16 @@ async def run_bot(name, bot_cfg, startup_delay=0):
             if bridge:
                 try:
                     await bridge.swg.disconnect()
+                except Exception:
+                    pass
+                # Close the DISCORD client too. discord.Client.start() does not tear
+                # down its own aiohttp session or gateway websocket — only close() does.
+                # Without this, every cancellation (now reachable on EVERY config
+                # hot-reload, not just shutdown) leaks a session + fd and leaves a
+                # zombie gateway connection alive under the same bot token.
+                try:
+                    if not bridge.is_closed():
+                        await bridge.close()
                 except Exception:
                     pass
 
