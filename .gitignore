@@ -8,3 +8,7 @@ node_modules/
 # Configs contain bot tokens and passwords — never commit
 configs/*.json
 !configs/example.json
+
+# local backups (configs/*.bak, pre-change .py snapshots) — never artifacts to track
+*.bak
+*.bak.*
