@@ -179,6 +179,47 @@ Each bot needs a JSON file in the `configs/` folder. See `configs/example.json` 
 | `verboseSWGLogging` | No | Log all SWG packets (default: false) |
 | `inOrderDelivery` | No | Enforce in-order reliable delivery + honest acking (default: false). See below. |
 | `inOrderStallSecs` | No | Seconds a sequence hole may persist under live traffic before the stall valve abandons it (default: 10). Only meaningful with `inOrderDelivery: true`. |
+| `fragmentSeqFix` | No | Stop burning a reliable sequence number on every fragmented **outbound** send (default: false). See below. |
+
+#### `fragmentSeqFix` — what it does and why
+
+`inOrderDelivery` (above) fixes the **inbound** direction. This fixes the **outbound** one, and it is a
+different bug: we were not losing packets, **we were never sending one.**
+
+`encode_soe_header()` consumes reliable sequence **N** for a `0x0009` packet. If the finished packet then
+exceeds 493 bytes, `encrypt()` hands it to `_fragment_and_encrypt()`, which drops the `0x0009` header
+carrying N and re-headers the payload as `0x000d` fragments taking **fresh** sequences N+1, N+2, …
+**N is consumed and never transmitted.**
+
+Core3 is strictly in-order on receive (`BaseClient::validatePacket`): a packet above the expected sequence
+is parked in `receiveBuffer`, answered with `OutOfOrder`, and **not processed** — `clientSequence` never
+advances. We have no outbound retransmit and used to ignore `OutOfOrder` entirely, so nothing ever filled
+the hole. The bot's whole **outbound** channel (Discord → game) went dead, while inbound stayed perfectly
+healthy and `connected` stayed `True`. The only witness was `room_stale` climbing until the 300s
+room-query self-heal forced a reconnect.
+
+**The trigger is routine, not an edge case:** the payload is UTF-16 (2 bytes/char), so **any relayed message
+over ~210 characters fragments** — as does any `/tell` over ~200. On 2026-07-12 this took the `tc` bot down
+twice in one day (a 212-char and a 291-char relay), each for 304s. `live` was exposed too and merely lucky
+that player chat is short.
+
+**On:** the first fragment reuses N (it is still sitting in the header we discard), so the outbound stream
+stays contiguous. A guard refuses to fragment any packet that is not a pre-stamped `0x0009` — without it a
+future non-sequenced caller would silently desync forever (`-1 & 0xFFFF == 65535`; `struct.pack_into` does
+not raise).
+
+**Health signals:** the `Health:` line gains `ooo=` (OutOfOrder packets received — Core3 telling us it is
+missing something **we** were supposed to send) and `oversize=`. `ooo` is the direct outbound-health number
+we never had. A small nonzero `ooo` is **normal** — ordinary UDP reordering between back-to-back fragment
+datagrams trips it and Core3 heals it from its own `receiveBuffer`. A **sustained climb** alongside a rising
+`room_stale` is the failure. `fragfix=on` appears in the health line when the flag is set.
+
+**Why it is flag-gated:** it *promotes a code path that has never once succeeded in production* — every
+fragmented message we have ever sent was parked by Core3 and destroyed at the next reconnect. If the fragment
+layout were wrong, Core3 disconnects the client as hostile, which is worse than the stall it cures. So roll it
+out one bot at a time. **Known residual:** this removes the *deterministic* hole, not the hole *class* — a
+genuinely lost fragment still stalls the channel until the 300s self-heal, and that exposure now scales with
+fragment count. Outbound retransmit is the real cure and is not built yet; keep the self-heal as the backstop.
 
 #### `inOrderDelivery` — what it does and why
 

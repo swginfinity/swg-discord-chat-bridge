@@ -9,7 +9,8 @@
     "ChatRoom": "SWG.Dantooine.Cantina",
     "verboseSWGLogging": false,
     "inOrderDelivery": false,
-    "inOrderStallSecs": 10
+    "inOrderStallSecs": 10,
+    "fragmentSeqFix": false
   },
   "Discord": {
     "BotName": "C-3PO Protocol Droid",

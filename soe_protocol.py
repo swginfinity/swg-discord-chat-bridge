@@ -118,6 +118,17 @@ class SOESession:
         self.reliable_accepted = 0
         self.multipacket_dropped = 0    # 0x0003 seen — our peer never sends these
 
+        # --- OUTBOUND health (2026-07-12). Core3 answers an out-of-order reliable
+        # packet with OutOfOrderMessage 0x0011 (BaseClient.cpp:953) and an accepted
+        # one with Ack 0x0015 (:1336). We decoded 0x0015 into a dict nobody read and
+        # had NO branch for 0x0011 at all, so the one direct signal that our OUTBOUND
+        # stream has a hole was thrown away. That blindness is why the fragmenter's
+        # sequence skip survived: an outbound stall looks perfectly healthy from here
+        # (inbound keeps flowing, connected stays True) — only room_stale moves.
+        # out_of_order_in > 0 means Core3 is missing a packet WE were supposed to send.
+        self.out_of_order_in = 0
+        self.oversize_out = 0           # datagram > Core3's 496B recvfrom cap (Packet.h:36)
+
         # --- In-order delivery (config: inOrderDelivery). See _accept_sequence. ---
         self.next_expected = 0          # the reliable id we need next (unbounded)
         self.initialized = False        # have we committed the server's sequence origin?
@@ -135,13 +146,23 @@ class SOESession:
 class SOEProtocol:
     """SOE protocol encoder/decoder."""
 
-    def __init__(self, verbose: bool = False, in_order: bool = False):
+    def __init__(self, verbose: bool = False, in_order: bool = False,
+                 frag_seq_fix: bool = False):
         self.session = SOESession()
         self.verbose = verbose
         # in_order: hold the ack at the contiguous head instead of acking past a
         # gap (which makes Core3 delete the packet we never got). Default OFF —
         # enable per bot via config `inOrderDelivery` after watching the counters.
         self.in_order = in_order
+        # frag_seq_fix: stop burning a reliable sequence number on every fragmented
+        # send. See _fragment_and_encrypt. Default OFF — enable per bot via config
+        # `fragmentSeqFix`. Flag-gated ONLY because it promotes a code path that has
+        # never once succeeded in production (every fragmented message we have ever
+        # sent was parked by Core3 and destroyed at the next reconnect), so the blast
+        # radius of a layout mistake is a hostile-fragment disconnect
+        # (BasePacketHandler.cpp:499-524) — worse than the stall it cures. Roll it out
+        # one bot at a time; rollback is a config flip, no rebuild.
+        self.frag_seq_fix = frag_seq_fix
 
     def decrypt(self, data: bytearray) -> bytearray:
         """Decrypt an SOE packet using XOR block-chain cipher."""
@@ -215,10 +236,62 @@ class SOEProtocol:
         crc = generate_crc(bytes(result[0:offset]), self.session.crc_seed) & 0xFFFF
         struct.pack_into(">H", result, offset, crc)
 
+        # Core3 reads at most RAW_MAX_SIZE = 496 bytes per datagram (system/net/Packet.h:36,
+        # the recvfrom cap in Socket.cpp). The fragmentation test above runs on the
+        # PLAINTEXT size (> 493) and is never re-checked after compression — and zlib
+        # EXPANDS incompressible input by ~11B. So an incompressible 493B fragment can
+        # leave here at >496B, get truncated on arrival, fail CRC, and be dropped with
+        # NO ack and NO OutOfOrder — i.e. the exact same permanent outbound hole the
+        # fragment-seq fix exists to close, but invisible. Latin text compresses ~2:1 so
+        # this should never fire; count it rather than assert, because crashing a live
+        # relay bot over a rare oversize datagram is worse than logging one.
+        if len(result) > 496:
+            self.session.oversize_out += 1
+
         return result
 
     def _fragment_and_encrypt(self, data: bytearray) -> list:
-        """Fragment a large packet and encrypt each fragment."""
+        """Fragment a large packet and encrypt each fragment.
+
+        `data` arrives as [0x0009][seq N][payload...] — encode_soe_header() ALREADY
+        consumed reliable sequence N for it. We re-header that payload as 0x000d
+        fragments and drop the original 0x0009 header (i = 4), so the packet carrying
+        N is never transmitted.
+
+        THE BUG (fixed 2026-07-12): the fragments used to take FRESH sequences
+        N+1, N+2, ... — so N was consumed and never sent, punching a permanent hole in
+        our own outbound stream. Core3 is strictly in-order on receive: validatePacket
+        (BaseClient.cpp:940-962) parks anything above the expected seq in receiveBuffer,
+        answers OutOfOrder, and NEVER advances clientSequence. We have no retransmit and
+        ignored OutOfOrder, so nothing ever filled the hole: the bot's entire OUTBOUND
+        channel (Discord -> game) went dead until the 300s room-query self-heal forced a
+        reconnect — while inbound stayed perfectly healthy and `connected` stayed True.
+        Trigger is routine: the payload is UTF-16 (2 B/char), so any relayed message over
+        ~210 chars fragments. Cost the tc bot two 304s outages on 2026-07-12 (Jedhigh
+        212ch 14:58, Marsellus 291ch 21:28); live was exposed too, just lucky that player
+        chat is short.
+
+        THE FIX: reuse N — it is sitting right there in the header we are discarding
+        (data[2:4]) — and let the loop allocate only the fragments AFTER it. Fragment 0
+        is stamped N, so the wire stream stays contiguous. We deliberately read the seq
+        back out of `data` rather than rewinding self.session.sequence: a bare
+        `sequence -= 1` would be a silent catastrophe if a NON-pre-stamped packet ever
+        reached this path (Python's -1 & 0xFFFF == 65535 — struct.pack_into does not
+        raise, so we would stamp 65535 and desync forever with no exception and no log).
+        The opcode guard below makes that impossible instead of merely unlikely.
+        """
+        opcode = struct.unpack_from(">H", data, 0)[0]
+        if self.frag_seq_fix and opcode != 0x0009:
+            # Only a pre-stamped 0x0009 DataChannelA packet owns a reliable sequence to
+            # reuse. Today nothing else can get here (the only unsequenced encrypt()
+            # callers are encode_ack at 4B and encode_net_status at 40B, both far under
+            # the 493B threshold, and fragments are built at exactly 493B so they cannot
+            # re-enter). That is safety by accident — one constant change away from a
+            # silent desync. Fail loudly instead.
+            raise ValueError(
+                f"_fragment_and_encrypt: refusing to fragment unsequenced packet "
+                f"0x{opcode:04x} ({len(data)}B) — it owns no reliable sequence to reuse")
+
         packets = []
         swg_packet_size = 496 - 8 - 3  # First fragment has extra 4-byte length header
         i = 4  # Skip the first 4 bytes (SOE header already in data)
@@ -228,8 +301,14 @@ class SOEProtocol:
             if first:
                 head = bytearray(8)
                 struct.pack_into(">H", head, 0, 0x000d)
-                struct.pack_into(">H", head, 2, self.session.sequence & 0xFFFF)
-                # Don't increment sequence for first fragment
+                if self.frag_seq_fix:
+                    # Reuse N from the 0x0009 header we are dropping. Do NOT allocate a
+                    # new one, and do NOT increment: encode_soe_header already did.
+                    seq = struct.unpack_from(">H", data, 2)[0]
+                else:
+                    seq = self.session.sequence & 0xFFFF
+                    self.session.sequence += 1
+                struct.pack_into(">H", head, 2, seq)
                 struct.pack_into(">I", head, 4, len(data) - 4)
                 first = False
             else:
@@ -237,8 +316,8 @@ class SOEProtocol:
                 head = bytearray(4)
                 struct.pack_into(">H", head, 0, 0x000d)
                 struct.pack_into(">H", head, 2, self.session.sequence & 0xFFFF)
+                self.session.sequence += 1
 
-            self.session.sequence += 1
             chunk = data[i:i + swg_packet_size]
             packet = bytearray(head) + bytearray(chunk)
             packets.append(self.encrypt(packet))
@@ -929,6 +1008,21 @@ class SOEProtocol:
                     self.session.fragments = None
 
             return []
+
+        elif header == 0x0011:  # OutOfOrder — Core3 is MISSING one of OUR packets
+            # BaseClient.cpp:953 — the server sends this when it receives a reliable
+            # packet ABOVE the one it expects. It means our OUTBOUND stream has a hole:
+            # Core3 has parked this packet (and will park every later one) and will not
+            # advance clientSequence until the hole is filled. We have no retransmit, so
+            # today this is terminal for the outbound direction until the 300s self-heal.
+            # We had NO branch for this at all — the one direct signal that our send path
+            # is broken fell through to `return []`. Count it: it is the honest outbound
+            # health number, and the positive signal that the fragment-seq fix worked.
+            # NB: a small nonzero count is NORMAL — ordinary UDP reordering between
+            # back-to-back fragment datagrams trips it, and Core3 heals that from its own
+            # receiveBuffer. A SUSTAINED climb is the failure.
+            self.session.out_of_order_in += 1
+            return [{"type": "OutOfOrder", "sequence": struct.unpack_from(">H", buf, 2)[0]}]
 
         elif header == 0x0015:  # Ack
             return [{"type": "Ack", "sequence": struct.unpack_from(">H", buf, 2)[0]}]

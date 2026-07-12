@@ -90,7 +90,13 @@ class SWGChatClient:
         self.in_order = bool(cfg.get('inOrderDelivery', False))
         self.STALL_SECS = float(cfg.get('inOrderStallSecs', 10))
 
-        self.protocol = SOEProtocol(in_order=self.in_order)
+        # Fragment sequence fix: default OFF. Enable per bot with "fragmentSeqFix": true.
+        # Stops us burning a reliable sequence on every fragmented send (any relayed
+        # message over ~210 chars, and any tell over ~200). See _fragment_and_encrypt.
+        self.frag_seq_fix = bool(cfg.get('fragmentSeqFix', False))
+
+        self.protocol = SOEProtocol(in_order=self.in_order,
+                                    frag_seq_fix=self.frag_seq_fix)
         self.transport = None
         self.loop = None
 
@@ -182,7 +188,8 @@ class SWGChatClient:
         self.host = self.cfg['LoginAddress']
         self.port = self.cfg['LoginPort']
         self.ping_port = None
-        self.protocol = SOEProtocol(in_order=self.in_order)
+        self.protocol = SOEProtocol(in_order=self.in_order,
+                                    frag_seq_fix=self.frag_seq_fix)
 
         if self.transport:
             self.transport.close()
@@ -295,7 +302,8 @@ class SWGChatClient:
         self.log.info(f"Connecting to zone server {self.host}:{self.port}")
 
         session_key = self.protocol.session.session_key
-        self.protocol = SOEProtocol(in_order=self.in_order)
+        self.protocol = SOEProtocol(in_order=self.in_order,
+                                    frag_seq_fix=self.frag_seq_fix)
         self.protocol.session.session_key = session_key
         self._send_raw(self.protocol.encode_session_request())
 
@@ -745,6 +753,18 @@ class SWGChatClient:
                     extra += f" filtered={self.filtered_packets}"
                 if self.watchdog_trips:
                     extra += f" wdog={self.watchdog_trips}"
+                # OUTBOUND health. room_stale was the ONLY witness to an outbound stall
+                # (and it only samples every 5 min); ooo is the direct one — Core3 telling
+                # us it is missing a packet we were supposed to send. A small count is
+                # benign (UDP reordering between fragment datagrams, healed from Core3's
+                # receiveBuffer); a sustained climb with room_stale rising = outbound dead.
+                if self.protocol:
+                    if self.protocol.session.out_of_order_in:
+                        extra += f" ooo={self.protocol.session.out_of_order_in}"
+                    if self.protocol.session.oversize_out:
+                        extra += f" oversize={self.protocol.session.oversize_out}"
+                if self.frag_seq_fix:
+                    extra += " fragfix=on"
                 self.log.info(
                     f"Health: uptime={uptime}s connected={self.connected} "
                     f"room={self.chat_room_id} reconnects={self.reconnect_count} "
