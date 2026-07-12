@@ -986,7 +986,25 @@ class ChatBridge(discord.Client):
             ch_name = getattr(message.channel, 'name', 'DM')
             self.log.debug(f"discord msg: #{ch_name} {message.author.display_name}: {message.clean_content[:200]}")
 
-        if message.author == self.user or message.author.bot:
+        # Screen out ONLY our own messages, not every bot (MrO 2026-07-12: "the bot should
+        # just not relay its OWN messages, other bots should be fine").
+        #
+        # self.user IS this bot's own id, so this is the loop guard and it is sufficient:
+        # we post in-game chat into Discord as ourselves, and relaying that back into the
+        # game would loop forever. Nothing else we emit lands in a ChatChannel.
+        #
+        # The old blanket `or message.author.bot` was far too broad. It silently dropped
+        # EVERY message from EVERY other bot, so SpyNet's replies to players in #in-game
+        # were never relayed — the players got silence while SpyNet believed it had
+        # answered them (it had reached Discord, not the game). See
+        # project_chatbridge_bot_authors_never_reach_game.
+        #
+        # Cross-bot loop risk was checked before relaxing this (2026-07-12) and is nil:
+        # no two bridge instances share a ChatChannel inside one guild (the four guild
+        # bots are in separate guilds; live and tc share a guild but not a channel), and
+        # no bot's NotificationChannel is another bot's ChatChannel. Re-check both if a
+        # new bot config is ever added to an EXISTING guild.
+        if message.author == self.user:
             return
 
         # DMs: only from notification user
