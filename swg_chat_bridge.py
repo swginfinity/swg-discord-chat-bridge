@@ -24,6 +24,7 @@ import pathlib
 import re
 
 import discord
+import emoji
 
 from soe_protocol import SOEProtocol
 
@@ -70,41 +71,43 @@ NOISY_RECV_PACKETS = frozenset({
 })
 
 
-# Emoji / pictographs that a 2003 SWG client cannot render, stripped from anything we
-# relay INTO the game (MrO 2026-07-12: "need to filter them out").
+# --- Emoji -> text, for anything we relay INTO the game -----------------------------
 #
-# The astral ones (> U+FFFF) were not merely ugly, they were FATAL: one emoji made the
-# whole message silently vanish. A ustring declares its length in UTF-16 CODE UNITS, but
-# an astral char is 1 Python code point and 2 UTF-16 units, so the old length field ran
-# 2 bytes short and Core3 parsed room_id out of the middle of the message text -> the
-# chat was addressed to a nonexistent room. No emoji-bearing Discord message has EVER
-# reached the game. (_write_ustring now computes the count correctly too — that is the
-# protocol-level guard; this is the product-level one.)
+# A 2003 SWG client cannot render an emoji, and an emoji in the packet was FATAL: a
+# ustring declares its length in UTF-16 CODE UNITS, but an astral char (any emoji above
+# U+FFFF) is 1 Python code point and 2 UTF-16 units, so the old length field ran 2 bytes
+# short per emoji and Core3 parsed room_id out of the MIDDLE of the message text. The
+# chat went to a room that does not exist and the message SILENTLY VANISHED — which is
+# why no emoji-bearing Discord message has ever reached the game, at any length.
+# (_write_ustring now computes the count correctly; that is the protocol-level guard.
+# This is the product-level one.)
 #
-# BMP pictographs (miscellaneous symbols, dingbats, ...) never corrupted anything — they
-# are 1 unit — but the client renders them as junk, so they go too. Also dropped:
-# variation selectors, ZWJ and skin-tone modifiers, which are the glue in emoji sequences
-# and would otherwise be left behind as orphans.
-_EMOJI_RE = re.compile(
-    "["
-    "\U00010000-\U0010FFFF"   # ALL astral planes — the ones that broke the protocol
-    "←-⇿"           # arrows
-    "⌀-⏿"           # misc technical (incl. ⌚⏰)
-    "①-⓿"           # enclosed alphanumerics
-    "■-➿"           # geometric shapes, misc symbols, dingbats (☺✈❤✂)
-    "⬀-⯿"           # misc symbols and arrows (⭐⬅)
-    "〰〽㊗㊙"
-    "︀-️"           # variation selectors (VS15/VS16)
-    "‍"                  # zero-width joiner — emoji sequence glue
-    "]+"
-)
+# We convert rather than strip (MrO 2026-07-12) because it ROUND-TRIPS with the direction
+# that already works: a player types ":wink:" in game and Discord renders it as an emoji.
+# Sending ":wink:" the other way means both sides speak the same shortcodes.
+#   thumbsup -> :thumbsup:   wink -> :wink:   rocket -> :rocket:   heart -> :heart:
+# language="alias" is deliberate: it yields Discord/GitHub short names (:thumbsup:), not
+# the CLDR ones (:thumbs_up:).
+_CUSTOM_EMOJI_RE = re.compile(r"<a?:([A-Za-z0-9_]+):\d+>")   # Discord custom emoji
+_ASTRAL_RE = re.compile(r"[\U00010000-\U0010FFFF]")          # anything emoji lib missed
 
 
-def strip_emoji(s: str) -> str:
-    """Remove emoji/pictographs and collapse the whitespace they leave behind."""
+def emoji_to_text(s: str) -> str:
+    """Render emoji as :shortcode: text the SWG client can actually display.
+
+    Idempotent: already-ASCII text passes through unchanged.
+    """
     if not s:
         return s
-    return re.sub(r"\s{2,}", " ", _EMOJI_RE.sub("", s)).strip()
+    # Discord CUSTOM emoji arrive as <:name:12345>. NB this must run before the generic
+    # <...> tag strip in _on_discord_message, which would otherwise delete them outright.
+    s = _CUSTOM_EMOJI_RE.sub(r":\1:", s)
+    s = emoji.demojize(s, language="alias")
+    # Belt and braces: any astral char the emoji DB does not know (new Unicode, rare
+    # pictographs) would still be unrenderable in-game. It can no longer corrupt the
+    # packet now that the length field is right, but drop it rather than show garbage.
+    s = _ASTRAL_RE.sub("", s)
+    return re.sub(r"\s{2,}", " ", s).strip()
 
 
 # =============================================================================
@@ -456,8 +459,8 @@ class SWGChatClient:
         """Send a message to the SWG chatroom."""
         if not self.connected:
             return
-        message = strip_emoji(message)
-        sender = strip_emoji(sender)          # Discord display names carry emoji too
+        message = emoji_to_text(message)
+        sender = emoji_to_text(sender)        # Discord display names carry emoji too
         if not message.strip():
             # The message was nothing but emoji — there is nothing left to relay, and an
             # empty chat line in-game is just noise.
@@ -473,7 +476,7 @@ class SWGChatClient:
         """Send a tell to a player."""
         if not self.connected:
             return
-        message = strip_emoji(message)
+        message = emoji_to_text(message)
         if not message.strip():
             return
         if len(message) > 400:
@@ -1052,6 +1055,9 @@ class ChatBridge(discord.Client):
         # Forward chat channel messages to SWG
         if isinstance(message.channel, discord.TextChannel) and message.channel.name == self.discord_cfg['ChatChannel']:
             text = message.clean_content
+            # Emoji -> :shortcode: FIRST: the generic <...> strip below would otherwise
+            # delete Discord custom emoji (<:name:12345>) outright.
+            text = emoji_to_text(text)
             # Strip URLs — SWG client can't handle them and they cause disconnects
             text = re.sub(r'https?://\S+', '[link]', text)
             # Strip any HTML-like tags
