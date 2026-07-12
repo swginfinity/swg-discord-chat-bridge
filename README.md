@@ -181,6 +181,27 @@ Each bot needs a JSON file in the `configs/` folder. See `configs/example.json` 
 | `inOrderStallSecs` | No | Seconds a sequence hole may persist under live traffic before the stall valve abandons it (default: 10). Only meaningful with `inOrderDelivery: true`. |
 | `fragmentSeqFix` | No | Stop burning a reliable sequence number on every fragmented **outbound** send (default: false). See below. |
 
+#### Emoji (always on, no flag)
+
+Emoji in a Discord message are converted to `:shortcode:` text before being relayed into the game
+(`:thumbsup:`, `:wink:`, `:rocket:`, …), including Discord **custom** emoji (`<:kappa:123>` →
+`:kappa:`). A 2003 SWG client cannot render an emoji, and this **round-trips** with the direction
+that already worked — a player types `:wink:` in game and Discord renders it as an emoji.
+
+This was not cosmetic. **No Discord message containing an emoji had ever reached the game**, at any
+length — a bare `thanks 👍` died exactly like a 500-character paragraph. `_write_ustring` declared
+the string length in Python **code points** while writing **UTF-16LE bytes**. Those agree for the
+entire BMP (ASCII, accents, CJK) but *not* for an astral character: an emoji is 1 code point and
+**2 UTF-16 units**. So the declared count ran 2 bytes short per emoji, and Core3 parsed the spacer,
+`room_id` and `request_id` starting early — out of the middle of the message text. `room_id` came
+back garbage, the chat was addressed to a room that does not exist, and the message **silently
+vanished**: no error, no log, nothing in game.
+
+⚠️ **The two fixes interact.** Shortcodes are *longer* than the emoji they replace (a 299-char
+emoji-heavy message expands to ~517 chars), which pushes **more** messages over the ~210-char
+fragmentation threshold. Shipping this without `fragmentSeqFix` would therefore make the outbound
+stall fire *more often*, not less.
+
 #### `fragmentSeqFix` — what it does and why
 
 `inOrderDelivery` (above) fixes the **inbound** direction. This fixes the **outbound** one, and it is a
