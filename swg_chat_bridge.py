@@ -92,10 +92,32 @@ _CUSTOM_EMOJI_RE = re.compile(r"<a?:([A-Za-z0-9_]+):\d+>")   # Discord custom em
 _ASTRAL_RE = re.compile(r"[\U00010000-\U0010FFFF]")          # anything emoji lib missed
 
 
-def emoji_to_text(s: str) -> str:
-    """Render emoji as :shortcode: text the SWG client can actually display.
+# The SWG client has NO GLYPH for anything above Latin-1 (U+00FF) — it draws a box.
+# Emoji were the FATAL case (they corrupted the packet); these are merely UGLY, but they
+# are everywhere: an em-dash, a curly quote, an ellipsis, and the "∞" in the agent handles
+# (HK-∞, R2-∞) all render in-game as □. Seen 2026-07-12: "HK-□: ... earned its keep □ an"
+# — the first box is the infinity sign in the name, the second is an em-dash in the body.
+#
+# Transliterate what has an obvious ASCII equivalent, then drop whatever is left above
+# Latin-1 (accents and other Latin-1 chars are fine — the client renders those).
+_PUNCT_MAP = str.maketrans({
+    "—": "-",  "–": "-",  "―": "-",   # em / en / horizontal bar
+    "‘": "'",  "’": "'",  "‚": "'",   # curly single quotes
+    "“": '"',  "”": '"',  "„": '"',   # curly double quotes
+    "…": "...",                                  # ellipsis
+    "•": "*",  "·": "-",                    # bullets
+    "→": "->", "←": "<-",                   # arrows
+    "∞": "",                                     # infinity — the agent-handle suffix
+    "™": "(TM)", "©": "(C)", "®": "(R)",
+    " ": " ",                                    # non-breaking space
+})
 
-    Idempotent: already-ASCII text passes through unchanged.
+
+def emoji_to_text(s: str) -> str:
+    """Make text safe and readable for the SWG client.
+
+    Emoji -> :shortcode:, smart punctuation -> ASCII, then anything the client cannot
+    draw at all (> U+00FF) is dropped. Idempotent: plain ASCII passes through unchanged.
     """
     if not s:
         return s
@@ -107,6 +129,11 @@ def emoji_to_text(s: str) -> str:
     # pictographs) would still be unrenderable in-game. It can no longer corrupt the
     # packet now that the length field is right, but drop it rather than show garbage.
     s = _ASTRAL_RE.sub("", s)
+    s = s.translate(_PUNCT_MAP)
+    # Whatever survives above Latin-1 has no glyph — the client draws a box. Drop it.
+    # (CJK goes too; it already rendered as boxes, so the rest of the line now survives
+    # instead of the whole thing being unreadable.)
+    s = "".join(c for c in s if ord(c) <= 0xFF)
     return re.sub(r"\s{2,}", " ", s).strip()
 
 
@@ -460,11 +487,20 @@ class SWGChatClient:
         if not self.connected:
             return
         message = emoji_to_text(message)
-        sender = emoji_to_text(sender)        # Discord display names carry emoji too
+        # Display names carry emoji and symbols too — the "∞" in the agent handles (HK-∞,
+        # R2-∞) drew a box in-game until now.
+        # rstrip the separator the removed symbol was hanging off, or "HK-∞" relays as
+        # "HK-" with a dangling dash. (Only for the NAME — a trailing dash in a message
+        # body can be intentional.)
+        sender = emoji_to_text(sender).rstrip(" -_.,:;·|")
+        if not sender:
+            # The whole name was unrenderable (e.g. all CJK, or nothing but emoji). Don't
+            # relay a nameless ": message" line.
+            sender = "Discord"
         if not message.strip():
-            # The message was nothing but emoji — there is nothing left to relay, and an
-            # empty chat line in-game is just noise.
-            self.log.info(f"Dropping emoji-only message from {sender!r} — nothing to relay")
+            # Nothing left to relay after conversion, and an empty chat line in-game is
+            # just noise.
+            self.log.info(f"Dropping unrenderable-only message from {sender!r}")
             return
         colored = f' \\#ff3333{sender}: \\#ff66ff{message}'
         if len(colored) > 2000:
