@@ -459,8 +459,27 @@ class SWGChatClient:
         try:
             self.log.info(f"Reconnecting (attempt #{self.reconnect_count}, delay {self._reconnect_delay}s)...")
             if self.transport:
-                self.transport.close()
-                self.transport = None
+                # Send a PROTOCOL disconnect before dropping the socket. Closing
+                # the UDP socket alone leaves the SWG server holding our chatroom
+                # subscription, and it keeps routing chat to the dead session —
+                # the new session then receives ZERO inbound chat, permanently.
+                # This is the exact bug fixed in 420cba3 ("auto-restart uses
+                # disconnect() not stop() — prevents stale chatroom subscription",
+                # msgs_in=0 forever, seen on cwi/dc/live in April). That fix was
+                # applied to _auto_restart and shutdown, but NOT here — and this
+                # is the one teardown path that runs during a FAULT. So the
+                # self-heal was cementing the very deafness it meant to cure
+                # (2026-07-12). Best-effort: the socket may already be dead.
+                # try/finally: a task cancellation during the 0.2s await must not
+                # skip the close and leak the socket (GLM-5.2 review, 2026-07-12).
+                try:
+                    self._send_raw(self.protocol.encode_disconnect())
+                    await asyncio.sleep(0.2)      # let the packet leave
+                except Exception:
+                    pass
+                finally:
+                    self.transport.close()
+                    self.transport = None
             await asyncio.sleep(self._reconnect_delay)
             self._reconnect_delay = min(self._reconnect_delay * 2, 60)
             await self._connect()
@@ -567,10 +586,18 @@ class SWGChatClient:
             # Log metrics every 5 minutes
             uptime = int(time.time() - self.start_time)
             if uptime % 300 < 65:  # within the first health check of each 5-min window
+                # seq/room_stale are the diagnostics that were missing on 2026-07-12:
+                # `connected=True` only ever meant "socket alive", so a bot that had
+                # wrapped its 16-bit sequence (and was discarding every packet) read
+                # as perfectly healthy. seq crossing 65535 while msgs_in keeps
+                # climbing is the proof the wrap fix is working.
+                seq = self.protocol.session.last_sequence if self.protocol else -1
+                room_stale = int(time.time() - self.last_room_response)
                 self.log.info(
                     f"Health: uptime={uptime}s connected={self.connected} "
                     f"room={self.chat_room_id} reconnects={self.reconnect_count} "
-                    f"msgs_in={self.messages_received} msgs_out={self.messages_sent}"
+                    f"msgs_in={self.messages_received} msgs_out={self.messages_sent} "
+                    f"seq={seq} room_stale={room_stale}s"
                     f"{' in_stale=' + str(in_stale_checks) if in_stale_checks > 0 else ''}")
 
     def get_stats(self):

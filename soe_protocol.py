@@ -201,7 +201,7 @@ class SOEProtocol:
             if first:
                 head = bytearray(8)
                 struct.pack_into(">H", head, 0, 0x000d)
-                struct.pack_into(">H", head, 2, self.session.sequence)
+                struct.pack_into(">H", head, 2, self.session.sequence & 0xFFFF)
                 # Don't increment sequence for first fragment
                 struct.pack_into(">I", head, 4, len(data) - 4)
                 first = False
@@ -209,7 +209,7 @@ class SOEProtocol:
                 swg_packet_size = 496 - 4 - 3
                 head = bytearray(4)
                 struct.pack_into(">H", head, 0, 0x000d)
-                struct.pack_into(">H", head, 2, self.session.sequence)
+                struct.pack_into(">H", head, 2, self.session.sequence & 0xFFFF)
 
             self.session.sequence += 1
             chunk = data[i:i + swg_packet_size]
@@ -223,7 +223,7 @@ class SOEProtocol:
         """Create an SOE DataChannel header with sequence number."""
         buf = bytearray(10)
         struct.pack_into(">H", buf, 0, 0x0009)  # DataChannelA
-        struct.pack_into(">H", buf, 2, self.session.sequence)
+        struct.pack_into(">H", buf, 2, self.session.sequence & 0xFFFF)
         self.session.sequence += 1
         struct.pack_into("<H", buf, 4, operands)
         struct.pack_into("<I", buf, 6, opcode)
@@ -306,13 +306,76 @@ class SOEProtocol:
         off += 1
         return self.encrypt(header + buf[:off])
 
+    # --- Reliable-sequence handling (see SOE's own udplibrary) -----------------
+    # The wire carries only the LOW 16 BITS of the reliable id. That is
+    # deliberate — SOE's UdpLibrary.hpp: "since we can never have anywhere close
+    # to 65000 packets outstanding, we only need to send the low order word ...
+    # we can reconstruct the full id from that, we just need to take into account
+    # the wrap around issue."
+    #
+    # So the receiver MUST keep a wide monotonic id and reconstruct it from the
+    # 16-bit stamp. This decoder previously compared the RAW 16-bit stamp with
+    # `if sequence <= last_sequence: discard`, which is a monotonic test on a
+    # CIRCULAR counter: the moment the server's sequence rolled 65535 -> 0, every
+    # subsequent packet compared "old" and was silently discarded FOREVER. The
+    # bot stayed socket-alive (so `connected` remained True) while receiving
+    # nothing — the 2026-07-12 deafness. Wrap arrives after 65,536 packets, i.e.
+    # ~3.4h at live world-traffic rates, which is why the 4h AutoRestartTimer
+    # usually outran it and hid the bug.
+    #
+    # This mirrors UdpReliableChannel::GetReliableIncomingId (UdpLibrary.hpp:2069):
+    # prepend the last-known high word, then correct by +/- 0x10000 if the result
+    # lands outside the outstanding-packet window.
+    _WRAP_WINDOW = 30000        # SOE: cHardMaxOutstandingPackets ("don't change this")
+
+    def _reliable_incoming_id(self, stamp: int) -> int:
+        """Reconstruct the full (unbounded) reliable id from a 16-bit wire stamp."""
+        last = self.session.last_sequence
+        if last < 0:
+            return stamp                       # first packet of the session
+        rid = stamp | (last & ~0xFFFF)
+        if rid < last - self._WRAP_WINDOW:
+            rid += 0x10000                     # stamp wrapped forward
+        elif rid > last + self._WRAP_WINDOW:
+            rid -= 0x10000                     # stale straggler from before the wrap
+        return rid
+
+    def _accept_sequence(self, buf) -> bool:
+        """True if this reliable packet is NEW (and advance the id). False = old/dup.
+
+        Replaces `if sequence <= last_sequence` — same intent, but on the
+        reconstructed id so it survives the 16-bit rollover.
+        """
+        stamp = struct.unpack_from(">H", buf, 2)[0]
+        rid = self._reliable_incoming_id(stamp)
+        if rid <= self.session.last_sequence:
+            # A packet landing FAR behind the head is not an ordinary duplicate —
+            # it means our id and the server's have diverged, and every packet
+            # would be rejected from here on (silent, permanent deafness — the
+            # very failure this fix exists to kill). Make it loud rather than
+            # invisible. (GLM-5.2 review, 2026-07-12.)
+            if rid < self.session.last_sequence - self._WRAP_WINDOW:
+                print(f"[soe] WARN: reliable id {rid} is >{self._WRAP_WINDOW} behind "
+                      f"head {self.session.last_sequence} — sequence desync, session needs a reset")
+            return False
+        self.session.last_sequence = rid
+        return True
+
     def encode_ack(self) -> Optional[bytearray]:
-        """Encode an ACK packet."""
+        """Encode an ACK packet.
+
+        Compares on the reconstructed (unbounded) id, but sends only the LOW
+        16 BITS on the wire — exactly as SOE does. The old code packed
+        `last_sequence` straight into a >H field, which (a) short-circuited to
+        None forever once the ids stopped increasing across a wrap, so the bot
+        STOPPED ACKING and the server retransmitted endlessly, and (b) would now
+        raise struct.error once last_sequence exceeds 65535.
+        """
         if self.session.last_ack >= self.session.last_sequence:
             return None
         buf = bytearray(4)
         struct.pack_into(">H", buf, 0, 0x0015)
-        struct.pack_into(">H", buf, 2, self.session.last_sequence)
+        struct.pack_into(">H", buf, 2, self.session.last_sequence & 0xFFFF)
         self.session.last_ack = self.session.last_sequence
         return self.encrypt(buf)
 
@@ -578,6 +641,16 @@ class SOEProtocol:
             self.session.last_ack = -1
             self.session.last_sequence = -1
             self.session.request_id = 0
+            # A new session resets the sequence space, so any half-assembled
+            # fragment belongs to the DEAD one. Leaving it armed makes the next
+            # first-fragment append into a stale accumulator, and its 4-byte
+            # length field gets read as payload — poisoning every fragmented
+            # message that follows, forever. Both current new-session paths swap
+            # in a fresh SOEProtocol so this is defensive today, but a
+            # server-initiated resync on a live object would hit it.
+            # (GLM-5.2 review, 2026-07-12.)
+            self.session.fragments = None
+            self.session.fragment_length = 0
             return [{"type": "SessionResponse",
                      "connection_id": self.session.connection_id,
                      "crc_seed": self.session.crc_seed}]
@@ -602,10 +675,8 @@ class SOEProtocol:
             return []
 
         elif header == 0x0009:  # DataChannelA
-            sequence = struct.unpack_from(">H", buf, 2)[0]
-            if sequence <= self.session.last_sequence:
+            if not self._accept_sequence(buf):      # wrap-aware; see _reliable_incoming_id
                 return []
-            self.session.last_sequence = sequence
 
             operands = struct.unpack_from(">H", buf, 4)[0]
 
@@ -618,10 +689,8 @@ class SOEProtocol:
                 return [msg] if msg else []
 
         elif header == 0x000d:  # FragmentA
-            sequence = struct.unpack_from(">H", buf, 2)[0]
-            if sequence <= self.session.last_sequence:
+            if not self._accept_sequence(buf):      # wrap-aware; see _reliable_incoming_id
                 return []
-            self.session.last_sequence = sequence
 
             if self.session.fragments is None:
                 self.session.fragment_length = struct.unpack_from(">I", buf, 4)[0]
@@ -645,10 +714,8 @@ class SOEProtocol:
             return [{"type": "Ack", "sequence": struct.unpack_from(">H", buf, 2)[0]}]
 
         elif header == 0x0019:  # MultiSWG_A (multiple SWG messages)
-            sequence = struct.unpack_from(">H", buf, 2)[0]
-            if sequence <= self.session.last_sequence:
+            if not self._accept_sequence(buf):      # wrap-aware; see _reliable_incoming_id
                 return []
-            self.session.last_sequence = sequence
             return self._decode_multi_swg(buf, 4)
 
         return []
