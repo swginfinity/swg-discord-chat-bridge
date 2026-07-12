@@ -118,6 +118,11 @@ class SWGChatClient:
         self.messages_received = 0
         self.last_room_response = time.time()  # tracks last successful room query/enter
 
+        # Deafness watchdog (Phase 1b) + source filter (Phase 1a)
+        self.filtered_packets = 0     # datagrams dropped as not-from-our-peer
+        self.datagrams_in = 0         # non-ping datagrams accepted from our peer
+        self.watchdog_trips = 0
+
         self.verbose = cfg.get('verboseSWGLogging', False)
 
         if self.verbose:
@@ -136,7 +141,22 @@ class SWGChatClient:
             asyncio.create_task(self._ping_loop()),
             asyncio.create_task(self._netstatus_loop()),
             asyncio.create_task(self._health_check_loop()),
+            asyncio.create_task(self._deafness_watchdog()),
         ]
+
+        # A background task dying on an unhandled exception used to vanish silently,
+        # taking its safeguard with it (a struct.error killed the health task this way
+        # on 2026-07-12). Surface it instead.
+        for t in self._tasks:
+            t.add_done_callback(self._task_died)
+
+    def _task_died(self, task):
+        """A background task ended. If it crashed, say so — do not lose the safeguard silently."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self.log.error(f"BACKGROUND TASK DIED: {task.get_coro().__name__} — {exc!r}", exc_info=exc)
 
     async def stop(self):
         """Stop the UDP client and cancel background tasks."""
@@ -180,10 +200,27 @@ class SWGChatClient:
 
     def _on_data(self, data, addr):
         """Handle incoming UDP packet."""
+        # PHASE 1a — source filter. The login->zone handoff REUSES this socket:
+        # _handle_EnumerateCharacterId swaps in a fresh SOEProtocol() and retargets
+        # self.port, but the transport is never recreated. So the login server —
+        # which still has us in its sequenceBuffer and keeps resending its unacked
+        # head — can land packets on the ZONE protocol object. Decrypted with the
+        # wrong (or zero) crc_seed, a stale packet's reliable header is garbage,
+        # i.e. a RANDOM 16-bit sequence stamp fed straight into sequence state.
+        # Drop anything not from the peer we are currently talking to.
+        if addr[1] not in (self.port, self.ping_port):
+            self.filtered_packets += 1
+            return
+
+        # Liveness is stamped only for traffic we ACCEPT as ours. This must stay
+        # BELOW the filter: a stream of stale login-server packets refreshing
+        # last_message_time would suppress the 55s dead-link failsafe in _ack_loop.
         self.last_message_time = time.time()
 
         if self.ping_port and addr[1] == self.ping_port:
             return
+
+        self.datagrams_in += 1          # NON-ping datagrams — the watchdog's "traffic is flowing" signal
 
         try:
             packets = self.protocol.decode(data)
@@ -486,6 +523,55 @@ class SWGChatClient:
         finally:
             self._reconnecting = False
 
+    async def _deafness_watchdog(self):
+        """Force a reconnect when the SEQUENCE LAYER is dead but the socket is not.
+
+        Every deafness mode we have had or can construct shares one signature:
+        datagrams keep arriving, and not one reliable packet is ACCEPTED.
+          - 16-bit wrap desync (the 2026-07-12 outage): bots deaf ~3.4h into every
+            session while reporting connected=True.
+          - Poisoned bootstrap / sequence desync: every packet reads as a duplicate.
+          - A stalled hole under in-order delivery (below).
+          - Whatever we have not thought of yet. THIS is why the watchdog is keyed
+            on a liveness signal rather than on any specific fault.
+
+        Nothing today catches this class. The 55s no-data timer (_ack_loop) needs
+        TOTAL silence, and the server's own retransmits keep it fed forever. The
+        room-query self-heal needs `connected` AND a room id and takes 300s. A bot
+        stuck deaf mid-handshake never reaches `connected` at all, so it is covered
+        by NOTHING — Core3 resends the unacked handshake forever, the socket stays
+        warm, and the bot is silently dead until the 4h restart timer.
+
+        The >=10-datagram floor is the "traffic is actually flowing" gate: a quiet
+        dev server can legitimately see a 30s window with zero reliable packets
+        (just ~2 unsequenced net-status replies), and an unfloored watchdog would
+        reconnect-loop there forever. Every real deafness mode FLOODS the window
+        instead, because Core3 is retransmitting its unacked head at 0.6-2s
+        intervals. 10 sits an order of magnitude below the failure signature and an
+        order above quiet-idle.
+        """
+        WINDOW = 30.0
+        MIN_DATAGRAMS = 10
+        while True:
+            accepted_before = self.protocol.session.reliable_accepted
+            datagrams_before = self.datagrams_in
+            await asyncio.sleep(WINDOW)
+
+            if self.paused or self._reconnecting or not self.transport:
+                continue
+
+            accepted = self.protocol.session.reliable_accepted - accepted_before
+            datagrams = self.datagrams_in - datagrams_before
+
+            if accepted == 0 and datagrams >= MIN_DATAGRAMS:
+                self.watchdog_trips += 1
+                self.log.warning(
+                    f"WATCHDOG: {datagrams} datagrams in {WINDOW:.0f}s, ZERO reliable packets "
+                    f"accepted — sequence layer is deaf while the socket is alive. "
+                    f"Forcing reconnect (trip #{self.watchdog_trips})."
+                )
+                await self._reconnect()
+
     async def _ack_loop(self):
         """Send ACKs and check for timeouts."""
         while True:
@@ -592,12 +678,22 @@ class SWGChatClient:
                 # as perfectly healthy. seq crossing 65535 while msgs_in keeps
                 # climbing is the proof the wrap fix is working.
                 seq = self.protocol.session.last_sequence if self.protocol else -1
+                # rel_ok = reliable packets ACCEPTED. This is the honest liveness
+                # number: `connected` and even `seq` can look fine while the
+                # sequence layer is deaf. If rel_ok stops climbing while datagrams
+                # keep arriving, the bot is deaf — and the watchdog will say so.
+                rel_ok = self.protocol.session.reliable_accepted if self.protocol else -1
                 room_stale = int(time.time() - self.last_room_response)
+                extra = ""
+                if self.filtered_packets:
+                    extra += f" filtered={self.filtered_packets}"
+                if self.watchdog_trips:
+                    extra += f" wdog={self.watchdog_trips}"
                 self.log.info(
                     f"Health: uptime={uptime}s connected={self.connected} "
                     f"room={self.chat_room_id} reconnects={self.reconnect_count} "
                     f"msgs_in={self.messages_received} msgs_out={self.messages_sent} "
-                    f"seq={seq} room_stale={room_stale}s"
+                    f"seq={seq} rel_ok={rel_ok} room_stale={room_stale}s{extra}"
                     f"{' in_stale=' + str(in_stale_checks) if in_stale_checks > 0 else ''}")
 
     def get_stats(self):

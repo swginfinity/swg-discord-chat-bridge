@@ -108,6 +108,15 @@ class SOESession:
         self.fragments = None
         self.fragment_length = 0
 
+        # Deafness watchdog (Phase 1b). Counts reliable packets we actually
+        # ACCEPTED — not datagrams received. Every deafness mode we have had or
+        # can construct (16-bit wrap desync, poisoned bootstrap, a future
+        # hole-stall) shares one signature: datagrams keep arriving but this
+        # number stops moving. It is the only honest "the sequence layer is
+        # alive" signal we have; `connected` only ever meant "socket alive".
+        self.reliable_accepted = 0
+        self.multipacket_dropped = 0    # 0x0003 seen — our peer never sends these
+
 
 class SOEProtocol:
     """SOE protocol encoder/decoder."""
@@ -359,6 +368,7 @@ class SOEProtocol:
                       f"head {self.session.last_sequence} — sequence desync, session needs a reset")
             return False
         self.session.last_sequence = rid
+        self.session.reliable_accepted += 1     # watchdog liveness — see SOESession
         return True
 
     def encode_ack(self) -> Optional[bytearray]:
@@ -655,16 +665,29 @@ class SOEProtocol:
                      "connection_id": self.session.connection_id,
                      "crc_seed": self.session.crc_seed}]
 
-        elif header == 0x0003:  # MultiPacket
-            results = []
-            offset = 2
-            while offset < len(buf) - 3:
-                pkt_len = buf[offset]
-                offset += 1
-                sub_data = buf[offset:offset + pkt_len]
-                results.extend(self.decode(bytes(sub_data)))
-                offset += pkt_len
-            return results
+        elif header == 0x0003:  # MultiPacket — NOT sent by our peer; drop it.
+            # The old code recursed into decode() for each sub-packet. That was a
+            # DOUBLE-DECRYPT: the outer packet is already decrypted here, so each
+            # sub-packet got decrypted a second time — corrupting it, and turning a
+            # reliable sub-packet's header into a RANDOM 16-bit sequence stamp fed
+            # straight into sequence state. (It also sliced a 3-byte trailer that
+            # sub-packets do not carry, eating real payload.)
+            #
+            # Core3 NEVER sends this. BaseMultiPacket::add() emits
+            # `insertShort(0x0900); insertShort(0); insertShort(0x1900)` — a
+            # DataChannelA (0x0009) carrying operand 0x0019 — which is handled by
+            # the _decode_multi_swg path below. Verified 2026-07-12.
+            #
+            # So: we have never seen one, and cannot test a parser for it. Writing an
+            # unverifiable parser for a packet that never arrives is strictly worse
+            # than not having one — a mis-parse injects garbage into the sequence
+            # layer, which is the exact bug class this work exists to kill. If one
+            # ever DOES arrive, something is badly wrong (corruption, or a packet
+            # from a peer that is not ours). Say so loudly and drop it.
+            self.session.multipacket_dropped += 1
+            print(f"[soe] WARN: received a 0x0003 MultiPacket ({len(buf)}b) — Core3 never sends "
+                  f"these. Dropping (corruption or foreign peer?).")
+            return []
 
         elif header == 0x0005:  # Disconnect
             return [{"type": "Disconnect",
