@@ -84,7 +84,13 @@ class SWGChatClient:
         self.on_tell = on_tell
         self.on_server_status = on_server_status
 
-        self.protocol = SOEProtocol()
+        # In-order delivery: default OFF. Enable per bot with "inOrderDelivery": true.
+        # 10s of unfilled hole = ~16 of Core3's ~600ms resend cycles; generous on
+        # purpose, because a skip is a HARD COMMIT (once acked, Core3 deletes it).
+        self.in_order = bool(cfg.get('inOrderDelivery', False))
+        self.STALL_SECS = float(cfg.get('inOrderStallSecs', 10))
+
+        self.protocol = SOEProtocol(in_order=self.in_order)
         self.transport = None
         self.loop = None
 
@@ -175,7 +181,7 @@ class SWGChatClient:
         self.host = self.cfg['LoginAddress']
         self.port = self.cfg['LoginPort']
         self.ping_port = None
-        self.protocol = SOEProtocol()
+        self.protocol = SOEProtocol(in_order=self.in_order)
 
         if self.transport:
             self.transport.close()
@@ -288,7 +294,7 @@ class SWGChatClient:
         self.log.info(f"Connecting to zone server {self.host}:{self.port}")
 
         session_key = self.protocol.session.session_key
-        self.protocol = SOEProtocol()
+        self.protocol = SOEProtocol(in_order=self.in_order)
         self.protocol.session.session_key = session_key
         self._send_raw(self.protocol.encode_session_request())
 
@@ -578,6 +584,26 @@ class SWGChatClient:
             await asyncio.sleep(0.1)
             if self.paused:
                 continue
+            # STALL VALVE. If a hole refuses to fill while traffic is clearly still
+            # flowing, give up on it rather than sit deaf forever. In-order delivery
+            # turns "silently lose one packet" into "possibly stall", and a stall is
+            # the failure class this whole workstream exists to kill — so it needs an
+            # exit. Skipping IS today's behavior (lose it, move on), so the worst case
+            # is no worse than the status quo and this cannot create a NEW deafness mode.
+            #
+            # Gated on "datagrams are still arriving" — NOT on any buffer being
+            # non-empty, which was blind in exactly the cases that matter.
+            s = self.protocol.session
+            if (self.protocol.in_order and s.gap_since is not None
+                    and (time.monotonic() - s.gap_since) > self.STALL_SECS
+                    and (time.time() - self.last_message_time) < 5):
+                hole = s.next_expected
+                lost = self.protocol.force_skip_gap()
+                self.log.warning(
+                    f"STALL: reliable packet {hole} never arrived after "
+                    f"{self.STALL_SECS}s of live traffic — skipping to {s.next_expected} "
+                    f"({lost} packet(s) abandoned; total skipped={s.packets_skipped})")
+
             ack = self.protocol.encode_ack()
             if ack:
                 self._send_raw(ack)
@@ -1146,6 +1172,7 @@ async def run_all(config_path):
     # Directory mode — hot reload enabled
     bot_tasks = {}   # name -> asyncio.Task
     bot_configs = {}  # name -> config dict
+    config_mtimes = {}  # name -> config file mtime; drives hot-reload on CHANGE
     all_tasks = []
 
     def _cancel_all():
@@ -1168,6 +1195,51 @@ async def run_all(config_path):
                     if json_file.stem.startswith('example'):
                         continue
                     current_files.add(json_file.stem)
+
+                # Restart bots whose config CHANGED on disk.
+                # Without this, an edited config is never re-read: the loop below skips
+                # any bot that is already running, and run_bot() captured its cfg dict at
+                # task-creation time. So "flip a flag in the config" silently did nothing,
+                # and the only levers were a container restart (bounces all 6 bots) or a
+                # delete-then-re-add dance. That means a flag-gated rollout had no rollback
+                # at all — which is the whole point of gating it. (2026-07-12)
+                for json_file in path.glob('*.json'):
+                    name = json_file.stem
+                    if name.startswith('example') or name not in bot_tasks:
+                        continue
+                    try:
+                        mtime = json_file.stat().st_mtime
+                    except OSError:
+                        continue
+                    if config_mtimes.get(name) == mtime:
+                        continue
+                    if name not in config_mtimes:          # first sight — just record it
+                        config_mtimes[name] = mtime
+                        continue
+                    try:
+                        with open(json_file) as f:
+                            cfg = json.load(f)
+                        err = validate_config(cfg, json_file.name)
+                        if err:
+                            main_log.error(f"Hot-reload: '{name}' config changed but is INVALID "
+                                           f"({err}) — keeping the running bot on its old config.")
+                            config_mtimes[name] = mtime
+                            continue
+                    except Exception as e:
+                        # A half-written file (editor mid-save) must NOT kill a live bot.
+                        # Leave mtime unrecorded so we retry on the next scan.
+                        main_log.warning(f"Hot-reload: '{name}' config unreadable ({e}) — retrying.")
+                        continue
+
+                    main_log.info(f"Hot-reload: config changed — restarting bot '{name}'")
+                    config_mtimes[name] = mtime
+                    bot_tasks[name].cancel()
+                    try:
+                        await bot_tasks[name]
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    bot_configs[name] = cfg
+                    bot_tasks[name] = asyncio.create_task(run_bot(name, cfg))
 
                 # Start new bots
                 for json_file in path.glob('*.json'):

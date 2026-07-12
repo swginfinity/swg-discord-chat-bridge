@@ -13,6 +13,7 @@ Handles:
 import struct
 import zlib
 import os
+import time
 from typing import Optional
 
 # CRC lookup table (standard CRC-32 polynomial 0xEDB88320)
@@ -117,13 +118,29 @@ class SOESession:
         self.reliable_accepted = 0
         self.multipacket_dropped = 0    # 0x0003 seen — our peer never sends these
 
+        # --- In-order delivery (config: inOrderDelivery). See _accept_sequence. ---
+        self.next_expected = 0          # the reliable id we need next (unbounded)
+        self.initialized = False        # have we committed the server's sequence origin?
+        self.bootstrap_streak = 0       # consecutive in-order stamps seen while bootstrapping
+        self.gap_min = None             # LOWEST id seen ABOVE the hole (== min(pending), no payloads)
+        self.gap_since = None           # when the current hole formed (monotonic)
+        # instrumentation (always counted, even when the fix is OFF)
+        self.gaps_observed = 0
+        self.forced_skips = 0
+        self.packets_skipped = 0        # a skip to gap_min can drop MANY packets, not one
+        self.crc_mismatch = 0
+
 
 class SOEProtocol:
     """SOE protocol encoder/decoder."""
 
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, in_order: bool = False):
         self.session = SOESession()
         self.verbose = verbose
+        # in_order: hold the ack at the contiguous head instead of acking past a
+        # gap (which makes Core3 delete the packet we never got). Default OFF —
+        # enable per bot via config `inOrderDelivery` after watching the counters.
+        self.in_order = in_order
 
     def decrypt(self, data: bytearray) -> bytearray:
         """Decrypt an SOE packet using XOR block-chain cipher."""
@@ -336,8 +353,25 @@ class SOEProtocol:
     # prepend the last-known high word, then correct by +/- 0x10000 if the result
     # lands outside the outstanding-packet window.
     _WRAP_WINDOW = 30000        # SOE: cHardMaxOutstandingPackets ("don't change this")
+    _BOOTSTRAP_CONFIRM = 3      # consecutive in-order stamps before the origin is committed
 
     def _reliable_incoming_id(self, stamp: int) -> int:
+        """Reconstruct the full (unbounded) reliable id, centered on next_expected.
+
+        This is SOE's GetReliableIncomingId (UdpLibrary.hpp:2069), which centers on
+        mReliableIncomingId — i.e. the NEXT EXPECTED id, which is exactly what
+        next_expected is. (The legacy path below centers on last_sequence instead;
+        harmless there, but this is the conformant form.)
+        """
+        ref = self.session.next_expected
+        rid = stamp | (ref & ~0xFFFF)
+        if rid < ref - self._WRAP_WINDOW:
+            rid += 0x10000                     # stamp wrapped forward
+        elif rid > ref + self._WRAP_WINDOW:
+            rid -= 0x10000                     # stale straggler from before the wrap
+        return rid
+
+    def _reliable_incoming_id_legacy(self, stamp: int) -> int:
         """Reconstruct the full (unbounded) reliable id from a 16-bit wire stamp."""
         last = self.session.last_sequence
         if last < 0:
@@ -349,14 +383,124 @@ class SOEProtocol:
             rid -= 0x10000                     # stale straggler from before the wrap
         return rid
 
+    def _accept_inorder(self, buf) -> bool:
+        """IN-ORDER gate. True = deliver this packet now. False = drop it.
+
+        THE BUG THIS FIXES: the legacy gate below accepts ANY newer id and advances
+        past a GAP, and encode_ack then AckAlls past it. Core3's flushSendBuffer
+        (BaseClient.cpp:1407) deletes EVERY buffered packet <= that seq — INCLUDING
+        the one we never received — and after that deletion NO resend path can bring
+        it back. So one lost/reordered inbound packet is lost FOREVER, and we told
+        the server we had it. Sometimes that packet is a player's chat line.
+
+        THE FIX: never ack past a hole. We drop out-of-order packets rather than
+        buffering them, and Core3's checkup timer resends its unacked head — and the
+        dropped tail with it, in order (resendPackets() walks sequenceBuffer from
+        index 0, BaseClient.cpp:1181-1220). Measured live: reliable inbound is
+        8.5-11.8 pkt/s against a ~60 pkt/s resend ceiling, so it converges with ~5x
+        headroom. NOTE the ceiling is a RATE limit, not a burst size
+        (maxPacketResent = max(5, 30000*checkupTime/496), :1193).
+
+        We keep NO payload buffer. `gap_min` — the lowest id seen above the hole — is
+        min(pending) without the payloads, and it is what gives the stall valve
+        somewhere to jump.
+
+        NOT DOING (and do not "fix" this later): re-acking duplicates, as SOE does
+        (UdpLibrary.cpp:3552-3582). Against Core3 that is FATAL — acknowledgeServerPackets
+        cancels and re-arms the checkup timer on EVERY ack, including a duplicate
+        (the guard at :1369 is a strict `<`). Our ack loop runs at 100ms, so re-acking
+        dups would push the retransmit deadline out faster than it can ever fire ->
+        resendPackets() NEVER RUNS -> it would disable the one recovery mechanism this
+        whole design depends on. SOE's peer does not cancel-and-rearm. Core3 does.
+        Conform to the PEER, not the reference.
+        """
+        s = self.session
+        stamp = struct.unpack_from(">H", buf, 2)[0]
+
+        # BOOTSTRAP. We cannot assume the server starts at 0: `//serverSequence = 0;`
+        # is COMMENTED OUT in Core3's close() (BaseClient.cpp:362), so a reused
+        # BaseClient can begin mid-stream. Assuming 0 would make every real packet
+        # read as a duplicate -> permanent silent deafness. So we adopt the server's
+        # origin — but we require N consecutive in-order stamps before committing it,
+        # so that a single stray/reordered packet cannot define the origin.
+        if not s.initialized:
+            rid = stamp
+            if s.next_expected == 0 and s.bootstrap_streak == 0:
+                s.next_expected = rid           # provisional origin
+            if rid == s.next_expected:
+                s.bootstrap_streak += 1
+                s.next_expected += 1
+                s.reliable_accepted += 1
+                if s.bootstrap_streak >= self._BOOTSTRAP_CONFIRM:
+                    s.initialized = True
+                    if s.next_expected != self._BOOTSTRAP_CONFIRM:
+                        print(f"[soe] WARN: session origin was not 0 "
+                              f"(committed next_expected={s.next_expected})")
+                return True                     # deliver; ack is withheld until committed
+            # a stamp that breaks the streak: restart the bootstrap on THIS stamp
+            s.bootstrap_streak = 1
+            s.next_expected = rid + 1
+            s.reliable_accepted += 1
+            return True
+
+        rid = self._reliable_incoming_id(stamp)
+
+        if rid < s.next_expected:
+            return False                        # duplicate / already delivered — drop, do NOT re-ack
+
+        if rid == s.next_expected:              # the one we are waiting for
+            s.next_expected += 1
+            s.reliable_accepted += 1
+            s.gap_min = s.gap_since = None      # hole (if any) is closed
+            return True
+
+        # rid > next_expected: a GAP. Drop this packet and do NOT advance. We simply
+        # never ack past the hole, so Core3 keeps the missing packet at the head of
+        # its sequenceBuffer and resends it — and this packet with it.
+        if s.gap_min is None or rid < s.gap_min:
+            s.gap_min = rid
+        if s.gap_since is None:
+            s.gap_since = time.monotonic()
+            s.gaps_observed += 1
+        return False
+
+    def force_skip_gap(self) -> int:
+        """Stall valve: give up on an unfillable hole. Returns packets abandoned.
+
+        Jumps to gap_min (NOT next_expected+1) — a burst loss of k consecutive packets
+        must cost ONE skip, not k skips of STALL_SECS each.
+
+        The skip is EXACTLY today's lossy behavior (lose the packet, move on), so the
+        worst case is no worse than the status quo and this CANNOT create a new
+        permanent-deafness mode. That property is the whole reason the valve exists.
+        """
+        s = self.session
+        if s.gap_min is None or not s.initialized:
+            return 0
+        lost = s.gap_min - s.next_expected
+        s.next_expected = s.gap_min
+        s.gap_min = s.gap_since = None
+        s.forced_skips += 1
+        s.packets_skipped += max(lost, 0)
+
+        # 🔴 A forced skip jumps OVER packets — and if any of them were fragments, the
+        # accumulator now holds a message with a HOLE in it. Unlike an ordinary gap
+        # (where in-order delivery keeps the accumulator coherent, because the tail is
+        # resent in order), a skip genuinely poisons it. Drop the partial message.
+        s.fragments = None
+        s.fragment_length = 0
+        return max(lost, 0)
+
     def _accept_sequence(self, buf) -> bool:
         """True if this reliable packet is NEW (and advance the id). False = old/dup.
 
         Replaces `if sequence <= last_sequence` — same intent, but on the
         reconstructed id so it survives the 16-bit rollover.
         """
+        if self.in_order:
+            return self._accept_inorder(buf)
         stamp = struct.unpack_from(">H", buf, 2)[0]
-        rid = self._reliable_incoming_id(stamp)
+        rid = self._reliable_incoming_id_legacy(stamp)
         if rid <= self.session.last_sequence:
             # A packet landing FAR behind the head is not an ordinary duplicate —
             # it means our id and the server's have diverged, and every packet
@@ -381,12 +525,32 @@ class SOEProtocol:
         STOPPED ACKING and the server retransmitted endlessly, and (b) would now
         raise struct.error once last_sequence exceeds 65535.
         """
-        if self.session.last_ack >= self.session.last_sequence:
-            return None
+        s = self.session
+        if self.in_order:
+            # Ack ONLY the contiguous head — never past a hole. This is SOE's
+            # AckAll(mReliableIncomingId - 1) (UdpLibrary.cpp:3565). Withholding is
+            # safe: Core3 ignores a lower ack (BaseClient.cpp:1369) and simply keeps
+            # the missing packet at the head of sequenceBuffer, where its checkup
+            # timer resends it.
+            # Nothing is acked until the bootstrap has committed the origin — acking
+            # a provisional origin would tell Core3 to delete packets we may still need.
+            if not s.initialized:
+                return None
+            ack_id = s.next_expected - 1
+            # STRICTLY ADVANCING. Never re-send an equal ack: an equal ack still
+            # cancels + re-arms Core3's checkup timer (:1369 is a strict `<`), which
+            # would starve the retransmit we depend on.
+            if ack_id < 0 or s.last_ack >= ack_id:
+                return None
+        else:
+            if s.last_ack >= s.last_sequence:
+                return None
+            ack_id = s.last_sequence
+
         buf = bytearray(4)
         struct.pack_into(">H", buf, 0, 0x0015)
-        struct.pack_into(">H", buf, 2, self.session.last_sequence & 0xFFFF)
-        self.session.last_ack = self.session.last_sequence
+        struct.pack_into(">H", buf, 2, ack_id & 0xFFFF)
+        s.last_ack = ack_id
         return self.encrypt(buf)
 
     def encode_disconnect(self) -> bytearray:
@@ -661,6 +825,14 @@ class SOEProtocol:
             # (GLM-5.2 review, 2026-07-12.)
             self.session.fragments = None
             self.session.fragment_length = 0
+            # In-order state belongs to the DEAD session. Carrying next_expected or a
+            # half-open gap into a fresh sequence space would reject every new packet
+            # as a "duplicate" — silent deafness. Reset it with everything else.
+            self.session.next_expected = 0
+            self.session.initialized = False
+            self.session.bootstrap_streak = 0
+            self.session.gap_min = None
+            self.session.gap_since = None
             return [{"type": "SessionResponse",
                      "connection_id": self.session.connection_id,
                      "crc_seed": self.session.crc_seed}]
