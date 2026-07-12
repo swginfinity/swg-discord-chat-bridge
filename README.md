@@ -177,6 +177,30 @@ Each bot needs a JSON file in the `configs/` folder. See `configs/example.json` 
 | `Character` | Yes | Character name to log in as |
 | `ChatRoom` | Yes | Chatroom path (e.g., `SWG.ServerName.RoomName`) |
 | `verboseSWGLogging` | No | Log all SWG packets (default: false) |
+| `inOrderDelivery` | No | Enforce in-order reliable delivery + honest acking (default: false). See below. |
+| `inOrderStallSecs` | No | Seconds a sequence hole may persist under live traffic before the stall valve abandons it (default: 10). Only meaningful with `inOrderDelivery: true`. |
+
+#### `inOrderDelivery` — what it does and why
+
+**Off (default, legacy):** the bridge acks whatever reliable packet it last saw, even if that packet arrived
+**out of order**. Core3's `flushSendBuffer(seq)` then deletes *every* buffered packet up to that sequence —
+including ones we never received. Those chat lines are **destroyed at the source and silently lost forever**;
+the bridge has no idea and reports itself perfectly healthy.
+
+**On:** the bridge only acks the **contiguous head** of the sequence. It drops out-of-order packets rather than
+acking past a hole, so Core3 retransmits the hole *and* everything after it. Nothing is destroyed before we
+have it. Trade-off: a hole that never fills would stall the stream, so a **stall valve** (`inOrderStallSecs`)
+abandons the hole after N seconds of *live traffic*, logging `STALL:` — this is strictly no worse than the
+legacy behaviour (which loses the packet anyway), just loud instead of silent.
+
+**Health signals:** the `Health:` line gains `rel_ok=` (reliable packets *accepted*) — the first honest
+"the sequence layer is alive" signal; `connected=True` only ever meant "socket alive", which is how a bot
+could sit deaf for hours. Healthy = `rel_ok` climbing, and `rel_ok ≈ seq + 1` means zero gaps.
+A **deafness watchdog** force-reconnects if no reliable packet is accepted in 30s while datagrams keep
+arriving (`WATCHDOG`). Both `STALL:` and `WATCHDOG` are wired into log-monitor and will page.
+
+**Rollout note:** the flag is per-bot and **hot-reloaded** — edit `configs/<bot>.json` and only that bot
+restarts (~10s, no rebuild, no container bounce). Rolling back is the same edit in reverse.
 
 ### Discord Section
 
