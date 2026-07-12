@@ -1400,9 +1400,30 @@ def _write_astring(buf: bytearray, off: int, s: str) -> int:
 
 
 def _write_ustring(buf: bytearray, off: int, s: str) -> int:
-    """Write a Unicode string: [uint32 LE char_count][UTF-16LE pairs]."""
+    """Write a Unicode string: [uint32 LE UTF-16-unit count][UTF-16LE units].
+
+    The count is in UTF-16 CODE UNITS, not Python code points. Those are the same
+    number for everything in the BMP (ASCII, accents, CJK) — but NOT for an astral
+    character (any emoji above U+FFFF), which is ONE code point and TWO UTF-16 units.
+
+    We used to declare len(s) (code points) while writing len(encoded) bytes. For a
+    message with one emoji, Core3 therefore read the text 2 bytes SHORT and then parsed
+    the 4-byte spacer, the room_id and the request_id starting 2 bytes early — out of
+    the middle of the message text. room_id came out as garbage (e.g. 65536), so the
+    chat was addressed to a room that does not exist and the message SILENTLY VANISHED.
+
+    That is why NO Discord message containing an emoji has ever reached the game — at
+    any length. It is unrelated to fragmentation: a short "thanks <thumbs-up>" died the
+    same way as a 500-char paragraph. Confirmed in-game 2026-07-12: MrO posted the same
+    message twice, once with emoji (never arrived) and once without (arrived).
+
+    Emoji are also stripped upstream now (strip_emoji, see swg_chat_bridge.send_chat) —
+    this is the belt-and-braces half: get the length field right so that ANY astral char
+    reaching the encoder from any other path (a character name, a tell) produces a
+    well-formed packet instead of a silently misrouted one.
+    """
     encoded = s.encode("utf-16-le")
-    struct.pack_into("<I", buf, off, len(s))
+    struct.pack_into("<I", buf, off, len(encoded) // 2)   # UTF-16 units, NOT code points
     buf[off + 4:off + 4 + len(encoded)] = encoded
     return off + 4 + len(encoded)
 

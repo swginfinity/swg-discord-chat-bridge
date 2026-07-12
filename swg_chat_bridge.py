@@ -70,6 +70,43 @@ NOISY_RECV_PACKETS = frozenset({
 })
 
 
+# Emoji / pictographs that a 2003 SWG client cannot render, stripped from anything we
+# relay INTO the game (MrO 2026-07-12: "need to filter them out").
+#
+# The astral ones (> U+FFFF) were not merely ugly, they were FATAL: one emoji made the
+# whole message silently vanish. A ustring declares its length in UTF-16 CODE UNITS, but
+# an astral char is 1 Python code point and 2 UTF-16 units, so the old length field ran
+# 2 bytes short and Core3 parsed room_id out of the middle of the message text -> the
+# chat was addressed to a nonexistent room. No emoji-bearing Discord message has EVER
+# reached the game. (_write_ustring now computes the count correctly too — that is the
+# protocol-level guard; this is the product-level one.)
+#
+# BMP pictographs (miscellaneous symbols, dingbats, ...) never corrupted anything — they
+# are 1 unit — but the client renders them as junk, so they go too. Also dropped:
+# variation selectors, ZWJ and skin-tone modifiers, which are the glue in emoji sequences
+# and would otherwise be left behind as orphans.
+_EMOJI_RE = re.compile(
+    "["
+    "\U00010000-\U0010FFFF"   # ALL astral planes — the ones that broke the protocol
+    "←-⇿"           # arrows
+    "⌀-⏿"           # misc technical (incl. ⌚⏰)
+    "①-⓿"           # enclosed alphanumerics
+    "■-➿"           # geometric shapes, misc symbols, dingbats (☺✈❤✂)
+    "⬀-⯿"           # misc symbols and arrows (⭐⬅)
+    "〰〽㊗㊙"
+    "︀-️"           # variation selectors (VS15/VS16)
+    "‍"                  # zero-width joiner — emoji sequence glue
+    "]+"
+)
+
+
+def strip_emoji(s: str) -> str:
+    """Remove emoji/pictographs and collapse the whitespace they leave behind."""
+    if not s:
+        return s
+    return re.sub(r"\s{2,}", " ", _EMOJI_RE.sub("", s)).strip()
+
+
 # =============================================================================
 # SWG Client (UDP) — async wrapper around SOE protocol
 # =============================================================================
@@ -419,6 +456,13 @@ class SWGChatClient:
         """Send a message to the SWG chatroom."""
         if not self.connected:
             return
+        message = strip_emoji(message)
+        sender = strip_emoji(sender)          # Discord display names carry emoji too
+        if not message.strip():
+            # The message was nothing but emoji — there is nothing left to relay, and an
+            # empty chat line in-game is just noise.
+            self.log.info(f"Dropping emoji-only message from {sender!r} — nothing to relay")
+            return
         colored = f' \\#ff3333{sender}: \\#ff66ff{message}'
         if len(colored) > 2000:
             colored = colored[:2000]
@@ -428,6 +472,9 @@ class SWGChatClient:
     def send_tell(self, player, message):
         """Send a tell to a player."""
         if not self.connected:
+            return
+        message = strip_emoji(message)
+        if not message.strip():
             return
         if len(message) > 400:
             message = message[:400]
